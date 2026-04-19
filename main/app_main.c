@@ -6,9 +6,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "driver/gpio.h"
-#include "rom/ets_sys.h"
-
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -18,6 +15,11 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 
+/* ---- active sensor: swap this include + pointer to change hardware ---- */
+#include "hcsr04.h"
+static const distance_sensor_t *s_sensor = &hcsr04_sensor;
+/* ----------------------------------------------------------------------- */
+
 /* ---------- user config ---------- */
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASS           "YOUR_WIFI_PASS"
@@ -26,70 +28,30 @@
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 /* --------------------------------- */
 
-/* ---------- HC-SR04 config -------
- * TRIG: GPIO5  → direct connection  (3.3 V output)
- * ECHO: GPIO4  → via 1 kΩ/2 kΩ voltage divider from 5 V echo line
- * --------------------------------- */
-#define HCSR04_TRIG_GPIO    GPIO_NUM_5
-#define HCSR04_ECHO_GPIO    GPIO_NUM_4
-#define HCSR04_TIMEOUT_US   38000           /* ~6.5 m max; datasheet max pulse */
-#define SOUND_SPEED_CM_US   0.034320f       /* cm per µs at 20 °C */
-
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
 
-/* Latest distance in mm, updated by sensor_task independent of Wi-Fi.
- * INT32_MIN means no echo / out of range. Stored as integer to avoid
- * %f in printf — the ESP8266 SDK lightweight libc drops float formats. */
-static volatile int32_t s_distance_mm = INT32_MIN;
+/* Latest reading in mm, INT32_MIN when invalid. Written by sensor_task,
+ * read by post_timer_cb. Atomic on single-core ESP8266 for 32-bit values. */
+static volatile int32_t s_distance_mm = DISTANCE_SENSOR_ERR;
 
 /* ------------------------------------------------------------------ */
-/*  HC-SR04 driver                                                      */
+/*  Sensor task — runs continuously regardless of network state        */
 /* ------------------------------------------------------------------ */
 
-static void hcsr04_init(void)
+static void sensor_task(void *arg)
 {
-    gpio_config_t io = {
-        .pin_bit_mask = (1ULL << HCSR04_TRIG_GPIO),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
-    gpio_set_level(HCSR04_TRIG_GPIO, 0);
-
-    io.pin_bit_mask = (1ULL << HCSR04_ECHO_GPIO);
-    io.mode         = GPIO_MODE_INPUT;
-    gpio_config(&io);
-}
-
-/* Returns distance in mm, or INT32_MIN on timeout / out-of-range.
- * Integer arithmetic only — avoids %f dependency in printf. */
-static int32_t hcsr04_read_mm(void)
-{
-    /* 10 µs trigger pulse */
-    gpio_set_level(HCSR04_TRIG_GPIO, 1);
-    ets_delay_us(10);
-    gpio_set_level(HCSR04_TRIG_GPIO, 0);
-
-    /* Wait for echo to go HIGH */
-    int64_t t0 = esp_timer_get_time();
-    while (gpio_get_level(HCSR04_ECHO_GPIO) == 0) {
-        if ((esp_timer_get_time() - t0) > HCSR04_TIMEOUT_US)
-            return INT32_MIN;
+    for (;;) {
+        int32_t mm = s_sensor->read_mm();
+        s_distance_mm = mm;
+        if (mm == DISTANCE_SENSOR_ERR) {
+            ESP_LOGW(TAG, "sensor: no reading / out of range");
+        } else {
+            ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm",
+                     mm / 10, mm % 10);
+        }
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
-    int64_t echo_start = esp_timer_get_time();
-
-    /* Wait for echo to go LOW */
-    while (gpio_get_level(HCSR04_ECHO_GPIO) == 1) {
-        if ((esp_timer_get_time() - echo_start) > HCSR04_TIMEOUT_US)
-            return INT32_MIN;
-    }
-    int64_t duration_us = esp_timer_get_time() - echo_start;
-
-    /* distance_mm = duration_us * 0.34320 / 2 ≈ duration_us * 3432 / 20000 */
-    return (int32_t)(duration_us * 3432 / 20000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -142,11 +104,10 @@ static void wifi_init(void)
 static void http_post(int32_t distance_mm)
 {
     char body[64];
-    if (distance_mm == INT32_MIN) {
+    if (distance_mm == DISTANCE_SENSOR_ERR) {
         snprintf(body, sizeof(body),
                  "{\"device\":\"retro-fit\",\"distance_cm\":null}");
     } else {
-        /* format as d.d cm without %f: e.g. 1234 mm → "123.4" */
         snprintf(body, sizeof(body),
                  "{\"device\":\"retro-fit\",\"distance_cm\":%"PRId32".%"PRId32"}",
                  distance_mm / 10, distance_mm % 10);
@@ -168,24 +129,6 @@ static void http_post(int32_t distance_mm)
         ESP_LOGE(TAG, "POST failed: %s", esp_err_to_name(err));
     }
     esp_http_client_cleanup(client);
-}
-
-/* ------------------------------------------------------------------ */
-/*  Sensor task — runs continuously regardless of network state        */
-/* ------------------------------------------------------------------ */
-
-static void sensor_task(void *arg)
-{
-    for (;;) {
-        int32_t mm = hcsr04_read_mm();
-        s_distance_mm = mm;
-        if (mm == INT32_MIN) {
-            ESP_LOGW(TAG, "HC-SR04: no echo / out of range");
-        } else {
-            ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm", mm / 10, mm % 10);
-        }
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
-    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,7 +154,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "retro-fit-device starting");
 
-    hcsr04_init();
+    ESP_ERROR_CHECK(s_sensor->init());
     xTaskCreate(sensor_task, "sensor", 2048, NULL, 5, NULL);
 
     wifi_init();
