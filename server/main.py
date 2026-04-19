@@ -14,14 +14,14 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -80,26 +80,14 @@ def init_db() -> None:
 # ---------------------------------------------------------------------------
 
 
-class SensorReading(BaseModel):
-    device: str
+class SingleReading(BaseModel):
     distance_cm: Optional[float] = None
+    timestamp_ms: int  # ms since device boot; used to reconstruct wall-clock time
 
-    @model_validator(mode="before")
-    @classmethod
-    def check_distance_type(cls, values: dict) -> dict:
-        """
-        Reject payloads where distance_cm is present but is neither a
-        number nor JSON null.  Pydantic would coerce strings like "abc"
-        into a validation error, but we want a clear 422 with a message
-        rather than a generic Pydantic error, so we intercept here.
-        """
-        if "distance_cm" in values:
-            raw = values["distance_cm"]
-            if raw is not None and not isinstance(raw, (int, float)):
-                raise ValueError(
-                    f"distance_cm must be a number or null, got {type(raw).__name__!r}"
-                )
-        return values
+
+class BatchReading(BaseModel):
+    device: str
+    readings: list[SingleReading]
 
     @field_validator("device")
     @classmethod
@@ -158,36 +146,43 @@ def on_startup() -> None:
 
 
 @app.post("/api/data", status_code=201)
-def ingest_reading(reading: SensorReading):
-    recorded_at = datetime.now(timezone.utc).isoformat()
+def ingest_reading(batch: BatchReading):
+    if not batch.readings:
+        return {"inserted": 0, "ids": []}
 
+    # The most-recent reading's timestamp_ms corresponds to "now" on the device.
+    # Back-compute each reading's wall-clock time from the relative offsets so
+    # that per-sample times are faithful even when readings arrive in a batch.
+    now = datetime.now(timezone.utc)
+    latest_ts = max(r.timestamp_ms for r in batch.readings)
+
+    inserted = []
     with get_db() as conn:
-        cursor = conn.execute(
-            "INSERT INTO readings (device, distance_cm, recorded_at) VALUES (?, ?, ?)",
-            (reading.device, reading.distance_cm, recorded_at),
-        )
-        row_id = cursor.lastrowid
+        for r in batch.readings:
+            delta_ms = latest_ts - r.timestamp_ms
+            recorded_at = (now - timedelta(milliseconds=delta_ms)).isoformat()
+            cursor = conn.execute(
+                "INSERT INTO readings (device, distance_cm, recorded_at) VALUES (?, ?, ?)",
+                (batch.device, r.distance_cm, recorded_at),
+            )
+            inserted.append({
+                "id": cursor.lastrowid,
+                "device": batch.device,
+                "distance_cm": r.distance_cm,
+                "recorded_at": recorded_at,
+            })
 
     logger.info(
-        "Reading #%d stored — device=%r  distance_cm=%s  recorded_at=%s",
-        row_id,
-        reading.device,
-        reading.distance_cm if reading.distance_cm is not None else "null (out of range)",
-        recorded_at,
+        "Batch of %d readings stored — device=%r  span=%.1f s",
+        len(inserted),
+        batch.device,
+        (latest_ts - min(r.timestamp_ms for r in batch.readings)) / 1000.0,
     )
 
-    # Fan-out to any connected SSE clients watching this device
-    _publish(
-        reading.device,
-        {
-            "id": row_id,
-            "device": reading.device,
-            "distance_cm": reading.distance_cm,
-            "recorded_at": recorded_at,
-        },
-    )
+    for row in inserted:
+        _publish(batch.device, row)
 
-    return {"id": row_id, "recorded_at": recorded_at}
+    return {"inserted": len(inserted), "ids": [row["id"] for row in inserted]}
 
 
 # ---------------------------------------------------------------------------
@@ -289,19 +284,9 @@ from fastapi.exceptions import RequestValidationError
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc: RequestValidationError):
-    errors = exc.errors()
-    # Look for a distance_cm type error and return the custom message
-    for err in errors:
-        loc = [str(l) for l in err.get("loc", [])]
-        if "distance_cm" in loc:
-            return JSONResponse(
-                status_code=422,
-                content={"detail": err["msg"]},
-            )
-    # Generic 400 for other payload problems (missing fields, wrong types, etc.)
     return JSONResponse(
-        status_code=400,
-        content={"detail": errors},
+        status_code=422,
+        content={"detail": exc.errors()},
     )
 
 
