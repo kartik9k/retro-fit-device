@@ -1,0 +1,2 @@
+# iOS captive portal headers exceed the 512-byte default
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

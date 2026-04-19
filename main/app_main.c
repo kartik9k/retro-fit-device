@@ -108,7 +108,9 @@ void app_main(void)
     ESP_LOGI(TAG, "retro-fit-device starting");
 
     ESP_ERROR_CHECK(s_sensor->init());
-    xTaskCreate(sensor_task, "sensor", 2048, NULL, 5, NULL);
+    /* Priority 8: above httpd/dns (5) so the echo pulse busy-wait is not
+     * preempted mid-measurement; well below WiFi stack tasks (~23). */
+    xTaskCreate(sensor_task, "sensor", 2048, NULL, 8, NULL);
 
     ESP_ERROR_CHECK(wifi_manager_init());
 
