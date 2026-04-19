@@ -22,8 +22,8 @@
 #define NVS_KEY_SSID    "ssid"
 #define NVS_KEY_PASS    "pass"
 
-#define MAX_SSID_LEN    33      /* 32 chars + null */
-#define MAX_PASS_LEN    65      /* 64 chars + null */
+#define WM_SSID_LEN     33      /* 32 chars + null */
+#define WM_PASS_LEN     65      /* 64 chars + null */
 #define POST_BODY_MAX   192     /* enough for url-encoded ssid + pass */
 
 #define CONNECTED_BIT   BIT0
@@ -40,8 +40,8 @@ static esp_err_t nvs_load(char *ssid, char *pass)
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
     if (err != ESP_OK) return err;
 
-    size_t ssid_len = MAX_SSID_LEN;
-    size_t pass_len = MAX_PASS_LEN;
+    size_t ssid_len = WM_SSID_LEN;
+    size_t pass_len = WM_PASS_LEN;
     err = nvs_get_str(h, NVS_KEY_SSID, ssid, &ssid_len);
     if (err == ESP_OK)
         err = nvs_get_str(h, NVS_KEY_PASS, pass, &pass_len);
@@ -191,7 +191,7 @@ static const char PROV_OK_HTML[] =
 static esp_err_t handle_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, PROV_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, PROV_HTML, strlen(PROV_HTML));
     return ESP_OK;
 }
 
@@ -205,11 +205,12 @@ static esp_err_t handle_post(httpd_req_t *req)
     }
     body[received] = '\0';
 
-    char ssid[MAX_SSID_LEN] = { 0 };
-    char pass[MAX_PASS_LEN] = { 0 };
+    char ssid[WM_SSID_LEN] = { 0 };
+    char pass[WM_PASS_LEN] = { 0 };
 
     if (!form_get(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID is required");
+        httpd_resp_set_status(req, HTTPD_400);
+        httpd_resp_send(req, "SSID is required", strlen("SSID is required"));
         return ESP_FAIL;
     }
     form_get(body, "password", pass, sizeof(pass));   /* password may be empty */
@@ -223,7 +224,7 @@ static esp_err_t handle_post(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Credentials saved for \"%s\" — restarting", ssid);
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, PROV_OK_HTML, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, PROV_OK_HTML, strlen(PROV_OK_HTML));
 
     vTaskDelay(pdMS_TO_TICKS(1000));    /* let the response flush */
     esp_restart();
@@ -296,8 +297,8 @@ esp_err_t wifi_manager_init(void)
     tcpip_adapter_init();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    char ssid[MAX_SSID_LEN] = { 0 };
-    char pass[MAX_PASS_LEN] = { 0 };
+    char ssid[WM_SSID_LEN] = { 0 };
+    char pass[WM_PASS_LEN] = { 0 };
 
     if (nvs_load(ssid, pass) == ESP_OK && ssid[0] != '\0') {
         return sta_connect(ssid, pass);
