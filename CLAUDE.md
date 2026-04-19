@@ -21,11 +21,19 @@ Three specialist agents own this project. Route every task to the right owner. F
 
 Both agents must check `HARDWARE.md` before any change that touches GPIO numbers, voltage assumptions, or sensor timing.
 
+### Firmware ↔ Server notification rule
+
+`API_CONTRACT.md` is the joint source of truth for the wire protocol between firmware and server. Neither agent may change the JSON format, endpoint path, field names/types, or batch behaviour unilaterally:
+
+- Either agent proposing a change must raise it with the other first and get explicit agreement.
+- Once agreed, `API_CONTRACT.md` is updated and both firmware and server are changed in **one atomic commit** — the repo must never contain a state where the two sides are incompatible.
+- Additive, non-breaking changes (new optional response field, server-only fix) still require a note in the `API_CONTRACT.md` change log.
+
 **Discussion protocol for cross-boundary changes:**
 1. Spawn all affected agents with their role context and the problem.
 2. Collect perspectives; surface conflicts (e.g. firmware memory limit vs. server schema preference).
 3. Synthesise a decision that satisfies all constraints.
-4. Implement — breaking wire-contract changes go in **one atomic commit** across all affected files.
+4. Update the relevant contract document (`HARDWARE.md` or `API_CONTRACT.md`) as part of the same commit.
 
 ## What this project is
 
