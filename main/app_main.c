@@ -1,5 +1,7 @@
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,10 +38,10 @@
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
 
-/* Latest distance reading, updated by sensor_task independent of Wi-Fi.
- * -1.0 means no echo / out of range. Single-core ESP8266: 32-bit aligned
- * float write is atomic, so no mutex needed for this scalar. */
-static volatile float s_distance_cm = -1.0f;
+/* Latest distance in mm, updated by sensor_task independent of Wi-Fi.
+ * INT32_MIN means no echo / out of range. Stored as integer to avoid
+ * %f in printf — the ESP8266 SDK lightweight libc drops float formats. */
+static volatile int32_t s_distance_mm = INT32_MIN;
 
 /* ------------------------------------------------------------------ */
 /*  HC-SR04 driver                                                      */
@@ -62,8 +64,9 @@ static void hcsr04_init(void)
     gpio_config(&io);
 }
 
-/* Returns distance in cm, or -1.0 on timeout / out-of-range. */
-static float hcsr04_read_cm(void)
+/* Returns distance in mm, or INT32_MIN on timeout / out-of-range.
+ * Integer arithmetic only — avoids %f dependency in printf. */
+static int32_t hcsr04_read_mm(void)
 {
     /* 10 µs trigger pulse */
     gpio_set_level(HCSR04_TRIG_GPIO, 1);
@@ -74,19 +77,19 @@ static float hcsr04_read_cm(void)
     int64_t t0 = esp_timer_get_time();
     while (gpio_get_level(HCSR04_ECHO_GPIO) == 0) {
         if ((esp_timer_get_time() - t0) > HCSR04_TIMEOUT_US)
-            return -1.0f;
+            return INT32_MIN;
     }
     int64_t echo_start = esp_timer_get_time();
 
     /* Wait for echo to go LOW */
     while (gpio_get_level(HCSR04_ECHO_GPIO) == 1) {
         if ((esp_timer_get_time() - echo_start) > HCSR04_TIMEOUT_US)
-            return -1.0f;
+            return INT32_MIN;
     }
-    int64_t echo_end = esp_timer_get_time();
+    int64_t duration_us = esp_timer_get_time() - echo_start;
 
-    float duration_us = (float)(echo_end - echo_start);
-    return duration_us * SOUND_SPEED_CM_US / 2.0f;
+    /* distance_mm = duration_us * 0.34320 / 2 ≈ duration_us * 3432 / 20000 */
+    return (int32_t)(duration_us * 3432 / 20000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -136,15 +139,17 @@ static void wifi_init(void)
 /*  HTTP POST                                                           */
 /* ------------------------------------------------------------------ */
 
-static void http_post(float distance_cm)
+static void http_post(int32_t distance_mm)
 {
     char body[64];
-    if (distance_cm < 0.0f) {
+    if (distance_mm == INT32_MIN) {
         snprintf(body, sizeof(body),
                  "{\"device\":\"retro-fit\",\"distance_cm\":null}");
     } else {
+        /* format as d.d cm without %f: e.g. 1234 mm → "123.4" */
         snprintf(body, sizeof(body),
-                 "{\"device\":\"retro-fit\",\"distance_cm\":%.1f}", distance_cm);
+                 "{\"device\":\"retro-fit\",\"distance_cm\":%"PRId32".%"PRId32"}",
+                 distance_mm / 10, distance_mm % 10);
     }
 
     esp_http_client_config_t cfg = {
@@ -172,12 +177,12 @@ static void http_post(float distance_cm)
 static void sensor_task(void *arg)
 {
     for (;;) {
-        float dist = hcsr04_read_cm();
-        s_distance_cm = dist;
-        if (dist < 0.0f) {
+        int32_t mm = hcsr04_read_mm();
+        s_distance_mm = mm;
+        if (mm == INT32_MIN) {
             ESP_LOGW(TAG, "HC-SR04: no echo / out of range");
         } else {
-            ESP_LOGI(TAG, "Distance: %.1f cm", dist);
+            ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm", mm / 10, mm % 10);
         }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
@@ -195,7 +200,7 @@ static void post_timer_cb(void *arg)
         ESP_LOGW(TAG, "No IP yet, skipping POST");
         return;
     }
-    http_post(s_distance_cm);
+    http_post(s_distance_mm);
 }
 
 /* ------------------------------------------------------------------ */
