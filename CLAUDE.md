@@ -2,38 +2,40 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Team — agent roles and discussion protocol
+## Team — agents, contracts, and workflows
 
-Three specialist agents own this project. Route every task to the right owner. For anything that crosses boundaries, run a multi-agent discussion first — collect all perspectives, resolve conflicts, then implement.
+Four agents collaborate on this project. **No implementation starts before the requirement triage cycle is complete.**
 
 | Agent | Owns | Key constraints |
 |-------|------|-----------------|
+| **Product Manager** | Requirements, product vision, scope decisions | Feeds requirements to the team; answers clarifying questions; signs off on refined spec |
 | **Firmware** | `main/` — FreeRTOS tasks, ESP8266 SDK, HTTP client, NVS, build system | Stack/heap limits, single-core atomicity, timer-context rules |
 | **Hardware** | `HARDWARE.md`, GPIO wiring, voltage levels, sensor selection, circuit design | 3.3 V / 5 V interfacing, HC-SR04 timing, drive strength |
 | **Server** | `server/` — FastAPI, SQLite schema, Pydantic models, SSE, deployment | Wire format compatibility, API contract, async correctness |
 
+### Requirement triage workflow (every new requirement)
+
+1. **PM states the requirement** — does not need to be fully specified.
+2. **All three specialists triage in parallel** — each produces an impact assessment, risks/constraints, and specific clarifying questions for the PM that surface ambiguity or hidden scope.
+3. **PM answers** — may revise or narrow the requirement.
+4. **Repeat** until all specialists confirm they have enough to implement correctly.
+5. **Implementation plan** — specialists agree on which files change, which contracts need updating, and the commit strategy.
+6. **Implementation** — contract documents updated in the same commit as the code.
+
 ### Hardware ↔ Firmware notification rule
 
-`HARDWARE.md` is the Hardware Agent's source of truth for all GPIO assignments, voltage levels, and timing constraints. Neither agent acts unilaterally on anything that touches the physical board:
+`HARDWARE.md` is the Hardware Agent's source of truth. Neither agent acts unilaterally on anything touching the physical board:
 
-- **Hardware Agent changing anything** → update `HARDWARE.md` first, then explicitly notify Firmware Agent of the delta so firmware constants (`TRIG_GPIO`, `ECHO_GPIO`, `TIMEOUT_US`, etc.) can be updated in the same change.
-- **Firmware Agent needing a hardware tweak** (different GPIO, relaxed timing, additional pull-up) → raise it with Hardware Agent first; do not assume wiring changes are free.
-
-Both agents must check `HARDWARE.md` before any change that touches GPIO numbers, voltage assumptions, or sensor timing.
+- **Hardware Agent changing anything** → update `HARDWARE.md` first, then notify Firmware Agent so firmware constants (`TRIG_GPIO`, `ECHO_GPIO`, `TIMEOUT_US`, etc.) are updated in the same commit.
+- **Firmware Agent needing a hardware tweak** → raise it with Hardware Agent first; do not assume wiring changes are free.
 
 ### Firmware ↔ Server notification rule
 
-`API_CONTRACT.md` is the joint source of truth for the wire protocol between firmware and server. Neither agent may change the JSON format, endpoint path, field names/types, or batch behaviour unilaterally:
+`API_CONTRACT.md` is jointly owned by Firmware and Server agents. Neither may change the JSON format, endpoint, field types, or batch behaviour unilaterally:
 
-- Either agent proposing a change must raise it with the other first and get explicit agreement.
-- Once agreed, `API_CONTRACT.md` is updated and both firmware and server are changed in **one atomic commit** — the repo must never contain a state where the two sides are incompatible.
-- Additive, non-breaking changes (new optional response field, server-only fix) still require a note in the `API_CONTRACT.md` change log.
-
-**Discussion protocol for cross-boundary changes:**
-1. Spawn all affected agents with their role context and the problem.
-2. Collect perspectives; surface conflicts (e.g. firmware memory limit vs. server schema preference).
-3. Synthesise a decision that satisfies all constraints.
-4. Update the relevant contract document (`HARDWARE.md` or `API_CONTRACT.md`) as part of the same commit.
+- Either agent proposing a change must get explicit agreement from the other first.
+- Agreed changes land in **one atomic commit** covering `API_CONTRACT.md`, firmware, and server — the repo must never be in a state where the two sides are incompatible.
+- Even non-breaking additions require a change-log entry in `API_CONTRACT.md`.
 
 ## What this project is
 
