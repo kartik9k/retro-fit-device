@@ -4,9 +4,13 @@ HTTP logging service for ESP8266 retro-fit distance sensor device.
 Endpoints:
   POST /api/data    - ingest a sensor reading
   GET  /api/data    - retrieve recent readings
+  GET  /api/stream  - SSE stream of new readings
   GET  /health      - liveness check
+  GET  /            - live visualizer UI
 """
 
+import asyncio
+import json
 import logging
 import sqlite3
 from contextlib import contextmanager
@@ -14,8 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator, model_validator
 
 # ---------------------------------------------------------------------------
@@ -112,10 +117,34 @@ class ReadingOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# SSE fan-out — one asyncio.Queue per connected client
+# ---------------------------------------------------------------------------
+
+# Maps device name -> set of queues for connected SSE clients.
+# Using a plain dict of sets; keys are created on first subscribe.
+_sse_subscribers: dict[str, set[asyncio.Queue]] = {}
+
+
+def _publish(device: str, row: dict) -> None:
+    """Called from the synchronous POST handler to fan-out a new row."""
+    queues = _sse_subscribers.get(device, set())
+    payload = json.dumps(row)
+    for q in list(queues):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass  # slow client — skip rather than block
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="ESP8266 Sensor Logger", version="1.0.0")
+
+STATIC_DIR = Path(__file__).parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.on_event("startup")
@@ -145,6 +174,17 @@ def ingest_reading(reading: SensorReading):
         reading.device,
         reading.distance_cm if reading.distance_cm is not None else "null (out of range)",
         recorded_at,
+    )
+
+    # Fan-out to any connected SSE clients watching this device
+    _publish(
+        reading.device,
+        {
+            "id": row_id,
+            "device": reading.device,
+            "distance_cm": reading.distance_cm,
+            "recorded_at": recorded_at,
+        },
     )
 
     return {"id": row_id, "recorded_at": recorded_at}
@@ -186,6 +226,57 @@ def get_readings(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/stream  — Server-Sent Events
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/stream")
+async def stream_readings(
+    device: str = Query(default="retro-fit", description="Device name to subscribe to"),
+):
+    queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+
+    # Register this client
+    _sse_subscribers.setdefault(device, set()).add(queue)
+    logger.info("SSE client connected for device=%r  (total=%d)", device, len(_sse_subscribers[device]))
+
+    async def event_generator():
+        try:
+            while True:
+                payload = await queue.get()
+                yield f"data: {payload}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _sse_subscribers[device].discard(queue)
+            logger.info(
+                "SSE client disconnected for device=%r  (remaining=%d)",
+                device,
+                len(_sse_subscribers.get(device, set())),
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering if behind a proxy
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /  — live visualizer
+# ---------------------------------------------------------------------------
+
+
+@app.get("/")
+async def index():
+    from fastapi.responses import FileResponse
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 # ---------------------------------------------------------------------------

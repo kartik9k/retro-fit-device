@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Retro-Fit Distance Monitor</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px 40px;
+      gap: 24px;
+    }
+
+    header {
+      text-align: center;
+    }
+
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      color: #7d8590;
+      text-transform: uppercase;
+    }
+
+    /* ── Current reading card ── */
+    #current-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 20px 40px;
+      text-align: center;
+      min-width: 220px;
+    }
+
+    #current-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #7d8590;
+      margin-bottom: 6px;
+    }
+
+    #current-value {
+      font-size: 3.5rem;
+      font-weight: 700;
+      line-height: 1;
+      color: #58a6ff;
+      transition: color 0.3s;
+    }
+
+    #current-value.out-of-range {
+      color: #f85149;
+      font-size: 2rem;
+    }
+
+    #current-time {
+      font-size: 0.7rem;
+      color: #484f58;
+      margin-top: 6px;
+    }
+
+    /* ── Status pill ── */
+    #status {
+      font-size: 0.7rem;
+      padding: 3px 10px;
+      border-radius: 999px;
+      border: 1px solid #30363d;
+      color: #7d8590;
+      letter-spacing: 0.05em;
+    }
+
+    #status.connected    { border-color: #238636; color: #3fb950; }
+    #status.disconnected { border-color: #6e4a1a; color: #d29922; }
+    #status.error        { border-color: #6e2020; color: #f85149; }
+
+    /* ── Chart wrapper ── */
+    #chart-wrapper {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 20px;
+      width: 100%;
+      max-width: 900px;
+    }
+
+    #chart-wrapper canvas {
+      width: 100% !important;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Retro-Fit Distance Monitor</h1>
+  </header>
+
+  <div id="current-card">
+    <div id="current-label">Current Distance</div>
+    <div id="current-value">—</div>
+    <div id="current-time"></div>
+  </div>
+
+  <span id="status">connecting…</span>
+
+  <div id="chart-wrapper">
+    <canvas id="chart" height="300"></canvas>
+  </div>
+
+<script>
+  // ── Config ────────────────────────────────────────────────────────────────
+  const DEVICE      = 'retro-fit';
+  const MAX_POINTS  = 60;
+
+  // ── DOM refs ──────────────────────────────────────────────────────────────
+  const currentValueEl = document.getElementById('current-value');
+  const currentTimeEl  = document.getElementById('current-time');
+  const statusEl       = document.getElementById('status');
+
+  // ── Chart setup ───────────────────────────────────────────────────────────
+  const ctx = document.getElementById('chart').getContext('2d');
+
+  const chartData = {
+    labels:   [],   // HH:MM:SS strings
+    datasets: [{
+      label:           'Distance (cm)',
+      data:            [],   // numbers or null
+      borderColor:     '#58a6ff',
+      backgroundColor: 'rgba(88,166,255,0.08)',
+      borderWidth:     2,
+      pointRadius:     3,
+      pointHoverRadius: 6,
+      pointBackgroundColor: '#58a6ff',
+      tension:         0.3,
+      fill:            true,
+      spanGaps:        false,  // null values become gaps
+    }],
+  };
+
+  const chart = new Chart(ctx, {
+    type: 'line',
+    data: chartData,
+    options: {
+      animation:   { duration: 200 },
+      responsive:  true,
+      maintainAspectRatio: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          labels: { color: '#7d8590', font: { size: 12 } },
+        },
+        tooltip: {
+          backgroundColor: '#1c2128',
+          borderColor:     '#30363d',
+          borderWidth:     1,
+          titleColor:      '#e6edf3',
+          bodyColor:       '#7d8590',
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              return v === null ? ' Out of range' : ` ${v.toFixed(1)} cm`;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          ticks:    { color: '#484f58', maxRotation: 45, font: { size: 11 } },
+          grid:     { color: '#21262d' },
+          border:   { color: '#30363d' },
+        },
+        y: {
+          title:  { display: true, text: 'cm', color: '#7d8590' },
+          ticks:  { color: '#484f58', font: { size: 11 } },
+          grid:   { color: '#21262d' },
+          border: { color: '#30363d' },
+        },
+      },
+    },
+  });
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  /** Format an ISO timestamp string as HH:MM:SS (local time). */
+  function toHMS(isoStr) {
+    const d = new Date(isoStr);
+    return d.toLocaleTimeString('en-GB', { hour12: false });
+  }
+
+  /** Push one {id, device, distance_cm, recorded_at} row onto the chart. */
+  function addPoint(row) {
+    chartData.labels.push(toHMS(row.recorded_at));
+    chartData.datasets[0].data.push(
+      typeof row.distance_cm === 'number' ? row.distance_cm : null
+    );
+
+    // Trim to MAX_POINTS
+    if (chartData.labels.length > MAX_POINTS) {
+      chartData.labels.shift();
+      chartData.datasets[0].data.shift();
+    }
+
+    chart.update('none');
+  }
+
+  /** Update the "current reading" card. */
+  function updateCard(row) {
+    if (typeof row.distance_cm === 'number') {
+      currentValueEl.textContent = row.distance_cm.toFixed(1) + ' cm';
+      currentValueEl.classList.remove('out-of-range');
+    } else {
+      currentValueEl.textContent = 'Out of range';
+      currentValueEl.classList.add('out-of-range');
+    }
+    currentTimeEl.textContent = new Date(row.recorded_at).toLocaleString();
+  }
+
+  function setStatus(state, text) {
+    statusEl.className = state;
+    statusEl.textContent = text;
+  }
+
+  // ── Load historical data then start SSE ───────────────────────────────────
+
+  async function loadHistory() {
+    try {
+      const res = await fetch(`/api/data?device=${encodeURIComponent(DEVICE)}&limit=${MAX_POINTS}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const rows = await res.json();        // newest-first
+      rows.reverse();                       // oldest-first for the chart
+      for (const row of rows) addPoint(row);
+      if (rows.length > 0) updateCard(rows[rows.length - 1]);
+    } catch (err) {
+      console.warn('Failed to load history:', err);
+    }
+  }
+
+  function startSSE() {
+    const url = `/api/stream?device=${encodeURIComponent(DEVICE)}`;
+    const es  = new EventSource(url);
+
+    es.onopen = () => setStatus('connected', 'live');
+
+    es.onmessage = (e) => {
+      try {
+        const row = JSON.parse(e.data);
+        addPoint(row);
+        updateCard(row);
+      } catch (err) {
+        console.warn('Bad SSE payload:', e.data, err);
+      }
+    };
+
+    es.onerror = () => {
+      setStatus('disconnected', 'reconnecting…');
+      // EventSource reconnects automatically; just update the status label.
+    };
+  }
+
+  // ── Boot ──────────────────────────────────────────────────────────────────
+  (async () => {
+    setStatus('', 'loading history…');
+    await loadHistory();
+    setStatus('', 'connecting…');
+    startSSE();
+  })();
+</script>
+</body>
+</html>
