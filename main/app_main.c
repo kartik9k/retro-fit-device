@@ -23,7 +23,7 @@ static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 /* ---------- user config ---------- */
 #define WIFI_SSID           "YOUR_WIFI_SSID"
 #define WIFI_PASS           "YOUR_WIFI_PASS"
-#define POST_URL            "http://yourserver.com/api/data"
+#define POST_URL            "http://192.168.1.100:5000/api/data"  /* TODO: set to server LAN IP */
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 /* --------------------------------- */
