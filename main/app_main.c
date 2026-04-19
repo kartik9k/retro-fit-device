@@ -1,7 +1,11 @@
 #include <string.h>
+#include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include "driver/gpio.h"
+#include "rom/ets_sys.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -16,11 +20,72 @@
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASS       "YOUR_WIFI_PASS"
 #define POST_URL        "http://yourserver.com/api/data"
-#define POST_PERIOD_US  (30ULL * 1000 * 1000)   /* 30 s in microseconds */
+#define POST_PERIOD_US  (30ULL * 1000 * 1000)   /* 30 s */
 /* --------------------------------- */
+
+/* ---------- HC-SR04 config -------
+ * TRIG: GPIO5  → direct connection  (3.3 V output)
+ * ECHO: GPIO4  → via 1 kΩ/2 kΩ voltage divider from 5 V echo line
+ * --------------------------------- */
+#define HCSR04_TRIG_GPIO    GPIO_NUM_5
+#define HCSR04_ECHO_GPIO    GPIO_NUM_4
+#define HCSR04_TIMEOUT_US   38000           /* ~6.5 m max; datasheet max pulse */
+#define SOUND_SPEED_CM_US   0.034320f       /* cm per µs at 20 °C */
 
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
+
+/* ------------------------------------------------------------------ */
+/*  HC-SR04 driver                                                      */
+/* ------------------------------------------------------------------ */
+
+static void hcsr04_init(void)
+{
+    gpio_config_t io = {
+        .pin_bit_mask = (1ULL << HCSR04_TRIG_GPIO),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(HCSR04_TRIG_GPIO, 0);
+
+    io.pin_bit_mask = (1ULL << HCSR04_ECHO_GPIO);
+    io.mode         = GPIO_MODE_INPUT;
+    gpio_config(&io);
+}
+
+/* Returns distance in cm, or -1.0 on timeout / out-of-range. */
+static float hcsr04_read_cm(void)
+{
+    /* 10 µs trigger pulse */
+    gpio_set_level(HCSR04_TRIG_GPIO, 1);
+    ets_delay_us(10);
+    gpio_set_level(HCSR04_TRIG_GPIO, 0);
+
+    /* Wait for echo to go HIGH */
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(HCSR04_ECHO_GPIO) == 0) {
+        if ((esp_timer_get_time() - t0) > HCSR04_TIMEOUT_US)
+            return -1.0f;
+    }
+    int64_t echo_start = esp_timer_get_time();
+
+    /* Wait for echo to go LOW */
+    while (gpio_get_level(HCSR04_ECHO_GPIO) == 1) {
+        if ((esp_timer_get_time() - echo_start) > HCSR04_TIMEOUT_US)
+            return -1.0f;
+    }
+    int64_t echo_end = esp_timer_get_time();
+
+    float duration_us = (float)(echo_end - echo_start);
+    return duration_us * SOUND_SPEED_CM_US / 2.0f;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Wi-Fi                                                               */
+/* ------------------------------------------------------------------ */
 
 static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
@@ -61,41 +126,71 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void http_post(void)
+/* ------------------------------------------------------------------ */
+/*  HTTP POST                                                           */
+/* ------------------------------------------------------------------ */
+
+static void http_post(float distance_cm)
 {
+    char body[64];
+    if (distance_cm < 0.0f) {
+        snprintf(body, sizeof(body),
+                 "{\"device\":\"retro-fit\",\"distance_cm\":null}");
+    } else {
+        snprintf(body, sizeof(body),
+                 "{\"device\":\"retro-fit\",\"distance_cm\":%.1f}", distance_cm);
+    }
+
     esp_http_client_config_t cfg = {
         .url    = POST_URL,
         .method = HTTP_METHOD_POST,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-
-    const char *body = "{\"device\":\"retro-fit\",\"value\":0}";
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, body, strlen(body));
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "POST %d", esp_http_client_get_status_code(client));
+        ESP_LOGI(TAG, "POST %d — %s",
+                 esp_http_client_get_status_code(client), body);
     } else {
         ESP_LOGE(TAG, "POST failed: %s", esp_err_to_name(err));
     }
     esp_http_client_cleanup(client);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Timer callback — sample sensor then POST                           */
+/* ------------------------------------------------------------------ */
+
 static void post_timer_cb(void *arg)
 {
     tcpip_adapter_ip_info_t ip;
-    if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) == ESP_OK
-            && ip.ip.addr != 0) {
-        http_post();
-    } else {
-        ESP_LOGW(TAG, "No IP yet, skipping POST");
+    if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) != ESP_OK
+            || ip.ip.addr == 0) {
+        ESP_LOGW(TAG, "No IP yet, skipping");
+        return;
     }
+
+    float dist = hcsr04_read_cm();
+    if (dist < 0.0f) {
+        ESP_LOGW(TAG, "HC-SR04: no echo / out of range");
+    } else {
+        ESP_LOGI(TAG, "Distance: %.1f cm", dist);
+    }
+
+    http_post(dist);
 }
+
+/* ------------------------------------------------------------------ */
+/*  Entry point                                                         */
+/* ------------------------------------------------------------------ */
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "retro-fit-device starting");
+
+    hcsr04_init();
     wifi_init();
 
     const esp_timer_create_args_t timer_args = {
