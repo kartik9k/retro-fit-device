@@ -5,6 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -19,13 +20,14 @@ static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 /* ----------------------------------------------------------------------- */
 
 /* ---------- user config ---------- */
-#define POST_URL            "http://192.168.1.100:5000/api/data"  /* TODO: set to server LAN IP */
+#define POST_URL            "http://192.168.1.65:5000/api/data"  /* TODO: set to server LAN IP */
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 /* --------------------------------- */
 
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
+static QueueHandle_t s_post_queue;
 
 /* Latest reading in mm, INT32_MIN when invalid. Written by sensor_task,
  * read by post_timer_cb. Atomic on single-core ESP8266 for 32-bit values. */
@@ -85,7 +87,7 @@ static void http_post(int32_t distance_mm)
 }
 
 /* ------------------------------------------------------------------ */
-/*  POST timer callback — network only, reads latest stored reading    */
+/*  POST timer callback — enqueues snapshot; never blocks              */
 /* ------------------------------------------------------------------ */
 
 static void post_timer_cb(void *arg)
@@ -96,7 +98,23 @@ static void post_timer_cb(void *arg)
         ESP_LOGW(TAG, "No IP yet, skipping POST");
         return;
     }
-    http_post(s_distance_mm);
+    int32_t mm = s_distance_mm;
+    /* Drop if post_task is still busy with the previous request. */
+    xQueueSend(s_post_queue, &mm, 0);
+}
+
+/* ------------------------------------------------------------------ */
+/*  POST task — owns the blocking HTTP call                            */
+/* ------------------------------------------------------------------ */
+
+static void post_task(void *arg)
+{
+    int32_t mm;
+    for (;;) {
+        if (xQueueReceive(s_post_queue, &mm, portMAX_DELAY) == pdTRUE) {
+            http_post(mm);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -107,10 +125,16 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "retro-fit-device starting");
 
+    s_post_queue = xQueueCreate(1, sizeof(int32_t));
+    configASSERT(s_post_queue);
+
     ESP_ERROR_CHECK(s_sensor->init());
     /* Priority 8: above httpd/dns (5) so the echo pulse busy-wait is not
      * preempted mid-measurement; well below WiFi stack tasks (~23). */
     xTaskCreate(sensor_task, "sensor", 2048, NULL, 8, NULL);
+    /* Priority 5: same as httpd/dns; HTTP can block for seconds without
+     * impacting sensor measurements or the timer task. */
+    xTaskCreate(post_task, "post", 4096, NULL, 5, NULL);
 
     ESP_ERROR_CHECK(wifi_manager_init());
 
