@@ -20,18 +20,23 @@ static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 /* ----------------------------------------------------------------------- */
 
 /* ---------- user config ---------- */
-#define POST_URL            "http://192.168.1.65:5000/api/data"  /* TODO: set to server LAN IP */
+#define POST_URL            "http://192.168.1.65:5000/api/data"
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
+#define READING_QUEUE_DEPTH 30                       /* ~60 s at 2 s/sample */
 /* --------------------------------- */
 
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
-static QueueHandle_t s_post_queue;
+static QueueHandle_t      s_reading_queue;
+static TaskHandle_t       s_post_task_handle;
 
-/* Latest reading in mm, INT32_MIN when invalid. Written by sensor_task,
- * read by post_timer_cb. Atomic on single-core ESP8266 for 32-bit values. */
-static volatile int32_t s_distance_mm = DISTANCE_SENSOR_ERR;
+/* Each queued reading carries a device-boot-relative timestamp so the server
+ * can reconstruct wall-clock time for every sample in a batch. */
+typedef struct {
+    int32_t  distance_mm;
+    uint32_t timestamp_ms;   /* ms since device boot; wraps ~49 days */
+} reading_t;
 
 /* ------------------------------------------------------------------ */
 /*  Sensor task — runs continuously regardless of network state        */
@@ -40,33 +45,62 @@ static volatile int32_t s_distance_mm = DISTANCE_SENSOR_ERR;
 static void sensor_task(void *arg)
 {
     for (;;) {
-        int32_t mm = s_sensor->read_mm();
-        s_distance_mm = mm;
-        if (mm == DISTANCE_SENSOR_ERR) {
+        reading_t r = {
+            .distance_mm  = s_sensor->read_mm(),
+            .timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000),
+        };
+        if (r.distance_mm == DISTANCE_SENSOR_ERR) {
             ESP_LOGW(TAG, "sensor: no reading / out of range");
         } else {
             ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm",
-                     mm / 10, mm % 10);
+                     r.distance_mm / 10, r.distance_mm % 10);
+        }
+        /* When the queue is full, evict the oldest reading so the newest
+         * data is always preserved. */
+        if (xQueueSend(s_reading_queue, &r, 0) != pdTRUE) {
+            reading_t discard;
+            xQueueReceive(s_reading_queue, &discard, 0);
+            xQueueSend(s_reading_queue, &r, 0);
         }
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
     }
 }
 
 /* ------------------------------------------------------------------ */
-/*  HTTP POST                                                           */
+/*  HTTP batch POST                                                     */
 /* ------------------------------------------------------------------ */
 
-static void http_post(int32_t distance_mm)
+/* Max body: 30 readings × ~50 chars + 40-char envelope ≈ 1540 bytes */
+#define BATCH_BUF_SZ  1600
+
+static void http_post_batch(const reading_t *batch, int count)
 {
-    char body[64];
-    if (distance_mm == DISTANCE_SENSOR_ERR) {
-        snprintf(body, sizeof(body),
-                 "{\"device\":\"retro-fit\",\"distance_cm\":null}");
-    } else {
-        snprintf(body, sizeof(body),
-                 "{\"device\":\"retro-fit\",\"distance_cm\":%"PRId32".%"PRId32"}",
-                 distance_mm / 10, distance_mm % 10);
+    static char body[BATCH_BUF_SZ];
+
+    int pos = snprintf(body, sizeof(body),
+                       "{\"device\":\"retro-fit\",\"readings\":[");
+    for (int i = 0; i < count; i++) {
+        const reading_t *r = &batch[i];
+        /* Reserve 4 bytes for closing "]}" and null terminator */
+        int room = (int)sizeof(body) - pos - 4;
+        if (room <= 0) {
+            ESP_LOGW(TAG, "batch truncated at %d/%d readings", i, count);
+            break;
+        }
+        if (r->distance_mm == DISTANCE_SENSOR_ERR) {
+            pos += snprintf(body + pos, room,
+                            "{\"distance_cm\":null,\"timestamp_ms\":%"PRIu32"}",
+                            r->timestamp_ms);
+        } else {
+            pos += snprintf(body + pos, room,
+                            "{\"distance_cm\":%"PRId32".%"PRId32
+                            ",\"timestamp_ms\":%"PRIu32"}",
+                            r->distance_mm / 10, r->distance_mm % 10,
+                            r->timestamp_ms);
+        }
+        if (i < count - 1) body[pos++] = ',';
     }
+    snprintf(body + pos, sizeof(body) - pos, "]}");
 
     esp_http_client_config_t cfg = {
         .url    = POST_URL,
@@ -78,8 +112,8 @@ static void http_post(int32_t distance_mm)
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "POST %d — %s",
-                 esp_http_client_get_status_code(client), body);
+        ESP_LOGI(TAG, "POST %d — %d readings flushed",
+                 esp_http_client_get_status_code(client), count);
     } else {
         ESP_LOGE(TAG, "POST failed: %s", esp_err_to_name(err));
     }
@@ -87,7 +121,7 @@ static void http_post(int32_t distance_mm)
 }
 
 /* ------------------------------------------------------------------ */
-/*  POST timer callback — enqueues snapshot; never blocks              */
+/*  POST timer callback — signals post_task; never blocks              */
 /* ------------------------------------------------------------------ */
 
 static void post_timer_cb(void *arg)
@@ -98,21 +132,26 @@ static void post_timer_cb(void *arg)
         ESP_LOGW(TAG, "No IP yet, skipping POST");
         return;
     }
-    int32_t mm = s_distance_mm;
-    /* Drop if post_task is still busy with the previous request. */
-    xQueueSend(s_post_queue, &mm, 0);
+    xTaskNotifyGive(s_post_task_handle);
 }
 
 /* ------------------------------------------------------------------ */
-/*  POST task — owns the blocking HTTP call                            */
+/*  POST task — drains the reading queue and fires one batch POST      */
 /* ------------------------------------------------------------------ */
 
 static void post_task(void *arg)
 {
-    int32_t mm;
+    static reading_t batch[READING_QUEUE_DEPTH];
     for (;;) {
-        if (xQueueReceive(s_post_queue, &mm, portMAX_DELAY) == pdTRUE) {
-            http_post(mm);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        int count = 0;
+        while (count < READING_QUEUE_DEPTH &&
+               xQueueReceive(s_reading_queue, &batch[count], 0) == pdTRUE) {
+            count++;
+        }
+        if (count > 0) {
+            http_post_batch(batch, count);
         }
     }
 }
@@ -125,16 +164,15 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "retro-fit-device starting");
 
-    s_post_queue = xQueueCreate(1, sizeof(int32_t));
-    configASSERT(s_post_queue);
+    s_reading_queue = xQueueCreate(READING_QUEUE_DEPTH, sizeof(reading_t));
+    configASSERT(s_reading_queue);
 
     ESP_ERROR_CHECK(s_sensor->init());
     /* Priority 8: above httpd/dns (5) so the echo pulse busy-wait is not
      * preempted mid-measurement; well below WiFi stack tasks (~23). */
     xTaskCreate(sensor_task, "sensor", 2048, NULL, 8, NULL);
-    /* Priority 5: same as httpd/dns; HTTP can block for seconds without
-     * impacting sensor measurements or the timer task. */
-    xTaskCreate(post_task, "post", 4096, NULL, 5, NULL);
+    /* Priority 5: HTTP can block for seconds without affecting the sensor. */
+    xTaskCreate(post_task, "post", 4096, NULL, 5, &s_post_task_handle);
 
     ESP_ERROR_CHECK(wifi_manager_init());
 
