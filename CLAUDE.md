@@ -9,8 +9,17 @@ Three specialist agents own this project. Route every task to the right owner. F
 | Agent | Owns | Key constraints |
 |-------|------|-----------------|
 | **Firmware** | `main/` — FreeRTOS tasks, ESP8266 SDK, HTTP client, NVS, build system | Stack/heap limits, single-core atomicity, timer-context rules |
-| **Hardware** | GPIO wiring, voltage levels, sensor selection, circuit design | 3.3 V / 5 V interfacing, HC-SR04 timing, drive strength |
+| **Hardware** | `HARDWARE.md`, GPIO wiring, voltage levels, sensor selection, circuit design | 3.3 V / 5 V interfacing, HC-SR04 timing, drive strength |
 | **Server** | `server/` — FastAPI, SQLite schema, Pydantic models, SSE, deployment | Wire format compatibility, API contract, async correctness |
+
+### Hardware ↔ Firmware notification rule
+
+`HARDWARE.md` is the Hardware Agent's source of truth for all GPIO assignments, voltage levels, and timing constraints. Neither agent acts unilaterally on anything that touches the physical board:
+
+- **Hardware Agent changing anything** → update `HARDWARE.md` first, then explicitly notify Firmware Agent of the delta so firmware constants (`TRIG_GPIO`, `ECHO_GPIO`, `TIMEOUT_US`, etc.) can be updated in the same change.
+- **Firmware Agent needing a hardware tweak** (different GPIO, relaxed timing, additional pull-up) → raise it with Hardware Agent first; do not assume wiring changes are free.
+
+Both agents must check `HARDWARE.md` before any change that touches GPIO numbers, voltage assumptions, or sensor timing.
 
 **Discussion protocol for cross-boundary changes:**
 1. Spawn all affected agents with their role context and the problem.
