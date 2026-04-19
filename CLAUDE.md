@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Team — agent roles and discussion protocol
+
+Three specialist agents own this project. Route every task to the right owner. For anything that crosses boundaries, run a multi-agent discussion first — collect all perspectives, resolve conflicts, then implement.
+
+| Agent | Owns | Key constraints |
+|-------|------|-----------------|
+| **Firmware** | `main/` — FreeRTOS tasks, ESP8266 SDK, HTTP client, NVS, build system | Stack/heap limits, single-core atomicity, timer-context rules |
+| **Hardware** | GPIO wiring, voltage levels, sensor selection, circuit design | 3.3 V / 5 V interfacing, HC-SR04 timing, drive strength |
+| **Server** | `server/` — FastAPI, SQLite schema, Pydantic models, SSE, deployment | Wire format compatibility, API contract, async correctness |
+
+**Discussion protocol for cross-boundary changes:**
+1. Spawn all affected agents with their role context and the problem.
+2. Collect perspectives; surface conflicts (e.g. firmware memory limit vs. server schema preference).
+3. Synthesise a decision that satisfies all constraints.
+4. Implement — breaking wire-contract changes go in **one atomic commit** across all affected files.
+
 ## What this project is
 
 An ESP8266 firmware that reads distance from an HC-SR04 ultrasonic sensor and POSTs readings over Wi-Fi to a companion Python/FastAPI server. The repo is self-contained: the ESP8266 RTOS SDK lives in `esp8266-rtos-sdk/` as a submodule, so no external SDK installation is required.
