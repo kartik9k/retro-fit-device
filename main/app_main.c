@@ -17,10 +17,11 @@
 #include "lwip/sys.h"
 
 /* ---------- user config ---------- */
-#define WIFI_SSID       "YOUR_WIFI_SSID"
-#define WIFI_PASS       "YOUR_WIFI_PASS"
-#define POST_URL        "http://yourserver.com/api/data"
-#define POST_PERIOD_US  (30ULL * 1000 * 1000)   /* 30 s */
+#define WIFI_SSID           "YOUR_WIFI_SSID"
+#define WIFI_PASS           "YOUR_WIFI_PASS"
+#define POST_URL            "http://yourserver.com/api/data"
+#define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
+#define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 /* --------------------------------- */
 
 /* ---------- HC-SR04 config -------
@@ -34,6 +35,11 @@
 
 static const char *TAG = "retro-fit";
 static esp_timer_handle_t s_post_timer;
+
+/* Latest distance reading, updated by sensor_task independent of Wi-Fi.
+ * -1.0 means no echo / out of range. Single-core ESP8266: 32-bit aligned
+ * float write is atomic, so no mutex needed for this scalar. */
+static volatile float s_distance_cm = -1.0f;
 
 /* ------------------------------------------------------------------ */
 /*  HC-SR04 driver                                                      */
@@ -160,7 +166,25 @@ static void http_post(float distance_cm)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Timer callback — sample sensor then POST                           */
+/*  Sensor task — runs continuously regardless of network state        */
+/* ------------------------------------------------------------------ */
+
+static void sensor_task(void *arg)
+{
+    for (;;) {
+        float dist = hcsr04_read_cm();
+        s_distance_cm = dist;
+        if (dist < 0.0f) {
+            ESP_LOGW(TAG, "HC-SR04: no echo / out of range");
+        } else {
+            ESP_LOGI(TAG, "Distance: %.1f cm", dist);
+        }
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  POST timer callback — network only, reads latest stored reading    */
 /* ------------------------------------------------------------------ */
 
 static void post_timer_cb(void *arg)
@@ -168,18 +192,10 @@ static void post_timer_cb(void *arg)
     tcpip_adapter_ip_info_t ip;
     if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) != ESP_OK
             || ip.ip.addr == 0) {
-        ESP_LOGW(TAG, "No IP yet, skipping");
+        ESP_LOGW(TAG, "No IP yet, skipping POST");
         return;
     }
-
-    float dist = hcsr04_read_cm();
-    if (dist < 0.0f) {
-        ESP_LOGW(TAG, "HC-SR04: no echo / out of range");
-    } else {
-        ESP_LOGI(TAG, "Distance: %.1f cm", dist);
-    }
-
-    http_post(dist);
+    http_post(s_distance_cm);
 }
 
 /* ------------------------------------------------------------------ */
@@ -191,6 +207,8 @@ void app_main(void)
     ESP_LOGI(TAG, "retro-fit-device starting");
 
     hcsr04_init();
+    xTaskCreate(sensor_task, "sensor", 2048, NULL, 5, NULL);
+
     wifi_init();
 
     const esp_timer_create_args_t timer_args = {
