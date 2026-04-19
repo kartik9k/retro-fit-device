@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "tcpip_adapter.h"
+#include "lwip/sockets.h"
 
 #define TAG             "wifi_mgr"
 #define NVS_NAMESPACE   "wifi_mgr"
@@ -132,6 +133,92 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 }
 
 /* ------------------------------------------------------------------ */
+/*  DNS server — redirects every query to the AP IP (captive portal)   */
+/* ------------------------------------------------------------------ */
+
+#define DNS_PORT    53
+#define DNS_BUF_SZ  512
+
+static void dns_server_task(void *arg)
+{
+    uint32_t ap_ip = *(uint32_t *)arg;  /* network-byte-order IP from lwIP */
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "DNS socket failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in addr = {
+        .sin_family      = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port        = htons(DNS_PORT),
+    };
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "DNS bind failed");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t buf[DNS_BUF_SZ];
+    struct sockaddr_in client;
+    socklen_t client_len = sizeof(client);
+
+    ESP_LOGI(TAG, "DNS server listening on port %d", DNS_PORT);
+
+    for (;;) {
+        int len = recvfrom(sock, buf, sizeof(buf), 0,
+                           (struct sockaddr *)&client, &client_len);
+        if (len < 12) continue;    /* too short to be a valid DNS query */
+
+        /* Copy query into response buffer, then patch header */
+        uint8_t resp[DNS_BUF_SZ];
+        memcpy(resp, buf, len);
+
+        /* Flags: QR=1 (response), AA=1 (authoritative), RCODE=0 (no error) */
+        resp[2] = 0x81;
+        resp[3] = 0x80;
+        /* ANCOUNT = 1 */
+        resp[6] = 0x00;
+        resp[7] = 0x01;
+
+        /* Skip past the question name (length-prefixed labels ending in 0x00)
+         * then skip QTYPE (2 bytes) + QCLASS (2 bytes) */
+        int pos = 12;
+        while (pos < len && buf[pos] != 0x00) {
+            pos += buf[pos] + 1;
+        }
+        pos += 5;   /* null label byte + QTYPE + QCLASS */
+
+        /* Answer record: pointer to name at offset 12 */
+        resp[pos++] = 0xC0;
+        resp[pos++] = 0x0C;
+        /* Type A */
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x01;
+        /* Class IN */
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x01;
+        /* TTL = 60 s */
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x3C;
+        /* RDLENGTH = 4 */
+        resp[pos++] = 0x00;
+        resp[pos++] = 0x04;
+        /* RDATA: copy IP bytes as-is (already network byte order in memory) */
+        memcpy(&resp[pos], &ap_ip, 4);
+        pos += 4;
+
+        sendto(sock, resp, pos, 0,
+               (struct sockaddr *)&client, client_len);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  STA connect (normal boot)                                           */
 /* ------------------------------------------------------------------ */
 
@@ -235,17 +322,27 @@ static esp_err_t handle_post(httpd_req_t *req)
 /*  Provisioning — start SoftAP + HTTP server, then block forever      */
 /* ------------------------------------------------------------------ */
 
+/* URIs probed by OS captive-portal detection — all serve the config form */
+static const char * const CAPTIVE_URIS[] = {
+    "/hotspot-detect.html",         /* iOS / macOS */
+    "/library/test/success.html",   /* older iOS */
+    "/generate_204",                /* Android / Chrome */
+    "/ncsi.txt",                    /* Windows */
+};
+
+static uint32_t s_ap_ip;   /* AP IP in network byte order, set before DNS task */
+
 static void start_provisioning(void)
 {
-    /* Build SSID from last 3 bytes of AP MAC  →  "retro-fit-AABBCC" */
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    /* Read MAC only after wifi init */
     uint8_t mac[6];
     esp_wifi_get_mac(WIFI_IF_AP, mac);
     char ap_ssid[24];
     snprintf(ap_ssid, sizeof(ap_ssid), "retro-fit-%02X%02X%02X",
              mac[3], mac[4], mac[5]);
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     wifi_config_t ap_cfg = {
         .ap = {
@@ -260,17 +357,33 @@ static void start_provisioning(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Provisioning AP: \"%s\"  →  open http://192.168.4.1",
-             ap_ssid);
+    /* Get the AP IP that was assigned by tcpip_adapter (default 192.168.4.1) */
+    tcpip_adapter_ip_info_t ip_info;
+    tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_AP, &ip_info);
+    s_ap_ip = ip_info.ip.addr;
+
+    ESP_LOGI(TAG, "Provisioning AP: \"%s\"  →  http://" IPSTR,
+             ap_ssid, IP2STR(&ip_info.ip));
+
+    /* DNS server: redirect every domain query to our IP so iOS/Android
+     * captive portal detection fires automatically */
+    xTaskCreate(dns_server_task, "dns_srv", 2048, &s_ap_ip, 5, NULL);
 
     httpd_config_t http_cfg = HTTPD_DEFAULT_CONFIG();
     httpd_handle_t server;
     ESP_ERROR_CHECK(httpd_start(&server, &http_cfg));
 
+    /* Main config page */
     httpd_uri_t get_uri  = { .uri = "/",        .method = HTTP_GET,  .handler = handle_get  };
     httpd_uri_t post_uri = { .uri = "/connect", .method = HTTP_POST, .handler = handle_post };
     httpd_register_uri_handler(server, &get_uri);
     httpd_register_uri_handler(server, &post_uri);
+
+    /* Captive portal probe URIs → same config form so the OS popup appears */
+    for (int i = 0; i < (int)(sizeof(CAPTIVE_URIS) / sizeof(CAPTIVE_URIS[0])); i++) {
+        httpd_uri_t u = { .uri = CAPTIVE_URIS[i], .method = HTTP_GET, .handler = handle_get };
+        httpd_register_uri_handler(server, &u);
+    }
 
     /* Block here — handle_post calls esp_restart() when done */
     vTaskDelay(portMAX_DELAY);
