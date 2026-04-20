@@ -123,51 +123,19 @@ problem can be observed and validated before building the fix.
 
 ## 6. PostgreSQL migration (SQLite → cloud database)
 
-**Why deferred:** SQLite is sufficient for local development with 2–3 devices.
-It cannot be shared across multiple server instances and is not suitable for
-cloud hosting.
-
-**Recommended target:** [Neon](https://neon.tech) — serverless PostgreSQL, free
-tier covers development and early production, no ops overhead.
-
-**What changes:**
-- Replace `sqlite3` calls in `server/main.py` with `asyncpg` (or `databases`
-  wrapper for a lighter migration).
-- `init_db()` becomes a startup migration step, not a table-create-if-not-exists.
-- Add Alembic for schema versioning (see item 8 below).
-- `DATABASE_URL` env var replaces the hard-coded `readings.db` path.
-- Update `server/requirements.txt`: add `asyncpg`, `alembic`; keep `aiosqlite`
-  only if a local fallback is desired.
-- Update SERVER.md in the same commit.
-
-**What must be true before implementing:**
-- Cloud hosting target confirmed (Railway/Render recommended — see item 7).
-- New multi-tenant schema designed and agreed (see item 9).
+**Status: IMPLEMENTED** — `server/main.py` now uses `asyncpg` against PostgreSQL.
+`DATABASE_URL` env var required. See `SERVER.md` § Database design.
 
 ---
 
 ## 7. Cloud hosting — app server deployment
 
-**Why deferred:** Server currently runs as `localhost`. Production requires a
-publicly accessible host so the ESP8266 in the field can POST over the internet.
+**Status: IMPLEMENTED** — Azure Container Apps (target: `retro-fit-dev` resource
+group). Provisioning script at `infra/azure-setup.sh`. CI/CD via
+`.github/workflows/deploy.yml`. Three deployment modes documented in `SERVER.md`.
 
-**Recommended target:** Railway or Render (both offer free tiers, Docker-based
-deploy, automatic HTTPS, environment variable management).
-
-**What changes:**
-- `Dockerfile` or `render.yaml` / `railway.toml` deploy config for the FastAPI
-  app.
-- `POST_URL` in firmware changes from `http://<LAN_IP>:5000/api/data` to
-  `https://<hostname>/api/data` — **this is a cross-boundary change** requiring
-  an atomic commit covering firmware, `API_CONTRACT.md`, and server config per
-  the Firmware ↔ Server notification rule.
-- HTTPS in firmware requires a CA certificate bundle embedded in flash; see item
-  10 below.
-- Update SERVER.md in the same commit.
-
-**What must be true before implementing:**
-- PostgreSQL migration (item 6) done first — deploying with SQLite to the cloud
-  is a dead end (ephemeral filesystem on most PaaS platforms).
+**Firmware HTTPS (Mode 3) still pending** — see item 10 for the cross-boundary
+atomic commit required when pointing devices at the Azure endpoint.
 
 ---
 
