@@ -118,3 +118,241 @@ needed — the SSE stream already carries `recorded_at` timestamps.
 
 **Blocked on:** Cellular driver being live in production so the actual UX
 problem can be observed and validated before building the fix.
+
+---
+
+## 6. PostgreSQL migration (SQLite → cloud database)
+
+**Why deferred:** SQLite is sufficient for local development with 2–3 devices.
+It cannot be shared across multiple server instances and is not suitable for
+cloud hosting.
+
+**Recommended target:** [Neon](https://neon.tech) — serverless PostgreSQL, free
+tier covers development and early production, no ops overhead.
+
+**What changes:**
+- Replace `sqlite3` calls in `server/main.py` with `asyncpg` (or `databases`
+  wrapper for a lighter migration).
+- `init_db()` becomes a startup migration step, not a table-create-if-not-exists.
+- Add Alembic for schema versioning (see item 8 below).
+- `DATABASE_URL` env var replaces the hard-coded `readings.db` path.
+- Update `server/requirements.txt`: add `asyncpg`, `alembic`; keep `aiosqlite`
+  only if a local fallback is desired.
+- Update SERVER.md in the same commit.
+
+**What must be true before implementing:**
+- Cloud hosting target confirmed (Railway/Render recommended — see item 7).
+- New multi-tenant schema designed and agreed (see item 9).
+
+---
+
+## 7. Cloud hosting — app server deployment
+
+**Why deferred:** Server currently runs as `localhost`. Production requires a
+publicly accessible host so the ESP8266 in the field can POST over the internet.
+
+**Recommended target:** Railway or Render (both offer free tiers, Docker-based
+deploy, automatic HTTPS, environment variable management).
+
+**What changes:**
+- `Dockerfile` or `render.yaml` / `railway.toml` deploy config for the FastAPI
+  app.
+- `POST_URL` in firmware changes from `http://<LAN_IP>:5000/api/data` to
+  `https://<hostname>/api/data` — **this is a cross-boundary change** requiring
+  an atomic commit covering firmware, `API_CONTRACT.md`, and server config per
+  the Firmware ↔ Server notification rule.
+- HTTPS in firmware requires a CA certificate bundle embedded in flash; see item
+  10 below.
+- Update SERVER.md in the same commit.
+
+**What must be true before implementing:**
+- PostgreSQL migration (item 6) done first — deploying with SQLite to the cloud
+  is a dead end (ephemeral filesystem on most PaaS platforms).
+
+---
+
+## 8. Schema versioning with Alembic
+
+**Why deferred:** No migrations needed during development with SQLite — `init_db()`
+recreates the table on schema changes.
+
+**Required for production** so schema changes can be applied to a live database
+without data loss.
+
+**What changes:**
+- `alembic init alembic` in `server/`.
+- `env.py` wired to `DATABASE_URL`.
+- Initial migration generated from the production schema (item 9).
+- All future schema changes land as Alembic revision files, not ad-hoc ALTER
+  TABLE statements.
+- CI step to run `alembic upgrade head` on deploy.
+- Update SERVER.md schema change log to reference Alembic revision IDs.
+
+---
+
+## 9. Multi-tenant database schema
+
+**Why deferred:** Current schema has a single `readings` table keyed by a raw
+`device` string. This is sufficient for development but cannot support multiple
+customers with access-scoped data.
+
+**Target schema (agreed during triage):**
+
+```sql
+CREATE TABLE accounts (
+    id            SERIAL PRIMARY KEY,
+    email         TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL CHECK (role IN ('operator', 'customer')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE devices (
+    id         SERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    name       TEXT NOT NULL,
+    device_key TEXT NOT NULL UNIQUE,  -- matches firmware "device" field
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE readings (
+    id          BIGSERIAL PRIMARY KEY,
+    device_id   INTEGER NOT NULL REFERENCES devices(id),
+    sensor_type TEXT NOT NULL,
+    value       REAL,
+    recorded_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX readings_device_recorded ON readings (device_id, recorded_at DESC);
+```
+
+**Auto-registration rule (PM decision):** On first POST from an unknown
+`device_key`, the server creates a new `devices` row with `account_id = NULL`
+(unowned). An operator can later claim it via the admin UI. This keeps firmware
+zero-config while preserving the ability to scope data later.
+
+**What changes in server:**
+- `POST /api/data`: resolve `device` string → `device_id` via `devices` lookup;
+  insert auto-registration row if not found.
+- `GET /api/data`: join `readings → devices`; scope by `account_id` when the
+  caller is authenticated as a customer.
+- `GET /api/stream`: same scoping.
+- Pydantic `ReadingOut` gains `device_name` field.
+
+---
+
+## 10. HTTPS in firmware
+
+**Why deferred:** `POST_URL` currently uses `http://`. Production hosting always
+terminates with HTTPS. The ESP8266 `esp_http_client` supports HTTPS but requires
+a PEM-encoded CA certificate bundle embedded in flash.
+
+**This is a cross-boundary change** — it requires simultaneous updates to:
+- Firmware: embed CA cert (`CONFIG_ESP_TLS_CERTIFICATE_BUNDLE` or a single PEM
+  in `main/certs/`), change `POST_URL` to `https://`.
+- `API_CONTRACT.md`: update base URL, note TLS requirement.
+- Server: ensure TLS termination is configured on the hosting platform.
+
+All three must land in one atomic commit per the Firmware ↔ Server notification
+rule.
+
+**What must be true before implementing:**
+- Cloud hosting (item 7) confirmed and HTTPS endpoint URL known.
+- CA bundle source identified: ESP-IDF ships `esp_crt_bundle` which covers most
+  public CAs (Let's Encrypt included). Verify the bundle is compatible with the
+  hosting platform's certificate chain.
+
+---
+
+## 11. Device API key authentication
+
+**Why deferred:** No auth on `POST /api/data` during development. In production
+an unauthenticated endpoint allows any device to inject readings.
+
+**Design:**
+- Each `devices` row gets a randomly generated `api_key` column (UUID or 32-byte
+  hex, generated server-side at auto-registration or by operator).
+- Firmware sends `Authorization: Bearer <api_key>` header on every POST.
+- Server validates header; rejects with 401 if missing or invalid.
+- `DEVICE_AUTH_REQUIRED` env flag (default `false`) — allows disabling during
+  development without code changes.
+
+**This is a cross-boundary change** — firmware must send the new header
+simultaneously with the server enforcing it. Coordinate per Firmware ↔ Server
+notification rule; land in one atomic commit covering `API_CONTRACT.md`, firmware
+(`wifi_transport.c` and `cellular_transport.c`), and server.
+
+**Firmware impact:** API key must be provisioned onto the device. Options:
+1. Baked into firmware at build time (simplest; requires a per-device build).
+2. Stored in NVS; written during captive-portal provisioning (adds a field to the
+   credential form).
+3. Stored in NVS; fetched from server after initial unauthenticated registration
+   POST (bootstrap flow — avoids per-device builds).
+
+Option 3 is recommended. Requires a new unauthenticated `POST /api/register`
+endpoint that returns the `api_key`; subsequent POSTs use it.
+
+---
+
+## 12. JWT dashboard authentication
+
+**Why deferred:** Dashboard is open during development (PM decision). Production
+requires login for customer-facing views.
+
+**Design:**
+- `POST /auth/login` — accepts email/password, returns short-lived JWT access
+  token in httpOnly cookie + long-lived refresh token in separate httpOnly cookie.
+- `POST /auth/refresh` — rotates access token using refresh token.
+- `POST /auth/logout` — clears both cookies.
+- `role` in JWT claims: `operator` (sees all devices/accounts) or `customer`
+  (sees only own devices).
+- `GET /api/data` and `GET /api/stream`: unauthenticated during development
+  (current behaviour); enforced scope when `DASHBOARD_AUTH_REQUIRED=true`.
+
+**Dependencies:**
+- Multi-tenant schema (item 9) must exist so `account_id` is available for
+  scoping.
+- bcrypt (or argon2) for password hashing.
+- `python-jose` or `PyJWT` for token generation.
+
+---
+
+## 13. Role-based dashboard views
+
+**Why deferred:** Current dashboard shows a single device stream. Production
+needs operator and customer views.
+
+**Operator view:**
+- Device selector dropdown populated from `GET /api/devices` (all devices across
+  all accounts).
+- Ability to claim unowned auto-registered devices, assign to accounts.
+- All readings visible regardless of account.
+
+**Customer view:**
+- Only devices belonging to the authenticated account appear.
+- No cross-account data visible.
+
+**Implementation note:** The SSE stream must carry `device_id` so the client can
+filter without polling. Currently `device` (the raw string) is in the SSE
+payload; update to `device_id` when the multi-tenant schema lands.
+
+**Blocked on:** JWT auth (item 12) and multi-tenant schema (item 9).
+
+---
+
+## 14. 30-day rolling data retention cleanup
+
+**Why deferred:** No data volume pressure during development.
+
+**Design:**
+- Background `asyncio` task started at server startup.
+- Runs every 24 hours: `DELETE FROM readings WHERE recorded_at < now() - interval '30 days'`.
+- Interval configurable via `DATA_RETENTION_DAYS` env var (default 30).
+- Log a count of deleted rows at INFO level each run.
+- No `API_CONTRACT.md` change required.
+
+**What must be true before implementing:**
+- PostgreSQL migration (item 6) done — the `interval` syntax is PostgreSQL-specific.
+  The equivalent SQLite query uses `datetime('now', '-30 days')` but implementing
+  this for SQLite is not worth the effort given the planned migration.
+- Update SERVER.md in the same commit.
