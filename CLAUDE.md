@@ -37,6 +37,14 @@ Four agents collaborate on this project. **No implementation starts before the r
 - Agreed changes land in **one atomic commit** covering `API_CONTRACT.md`, firmware, and server — the repo must never be in a state where the two sides are incompatible.
 - Even non-breaking additions require a change-log entry in `API_CONTRACT.md`.
 
+### Firmware NVS rule
+
+`NVS_STORAGE.md` is the Firmware Agent's source of truth for all Non-Volatile Storage layout:
+
+- Any commit that adds, removes, renames, or changes the type of an NVS namespace or key **must** update `NVS_STORAGE.md` in the same commit.
+- Document the migration strategy for any key rename or type change — stale keys are not erased automatically on firmware update.
+- The change log at the bottom of `NVS_STORAGE.md` must be updated with every change.
+
 ## What this project is
 
 An ESP8266 firmware that reads distance from an HC-SR04 ultrasonic sensor and POSTs readings over Wi-Fi to a companion Python/FastAPI server. The repo is self-contained: the ESP8266 RTOS SDK lives in `esp8266-rtos-sdk/` as a submodule, so no external SDK installation is required.
