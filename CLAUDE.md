@@ -14,6 +14,7 @@ documentation live in the agent-owned documents listed below.
 | **Firmware** | `firmware/` — FreeRTOS tasks, ESP8266 SDK, transport layer, NVS, build system | `FIRMWARE.md` |
 | **Hardware** | GPIO wiring, voltage levels, sensor selection, circuit design | `HARDWARE.md` |
 | **Server** | `server/` — FastAPI, SQLite schema, Pydantic models, SSE, deployment | `SERVER.md` |
+| **UI Developer** | `server/static/` — operator and customer dashboards, data visualisation, design system | `UI.md` |
 
 Each agent **must** keep their document current: any commit that changes
 behaviour described in that document must update the document in the same commit.
@@ -67,6 +68,19 @@ The NVS layout is documented in `FIRMWARE.md` (§ NVS Storage).
   and its change log in the same commit.
 - Document the migration strategy for any key rename or type change — stale
   keys are not erased automatically on firmware update.
+
+### UI ↔ Server (API contract for the dashboard)
+
+The UI Developer Agent consumes the Server Agent's REST and SSE endpoints.
+
+- **UI Agent needing a new endpoint or a change to an existing response shape**
+  → raise it with Server Agent first; do not build against an endpoint that does
+  not exist yet or assume undocumented fields are stable.
+- **Server Agent changing any endpoint path, method, or response field** → notify
+  UI Agent before merging so the dashboard is updated in the same commit.
+- Agreed additions or changes land in **one atomic commit** covering the server
+  code, `SERVER.md`, and the UI — the dashboard must never be deployed against
+  an API shape it was not written for.
 
 ---
 
