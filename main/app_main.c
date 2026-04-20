@@ -9,10 +9,8 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_http_client.h"
-#include "tcpip_adapter.h"
 
-#include "wifi_manager.h"
+#include "transport.h"
 
 /* ---- active sensor: swap this include + pointer to change hardware ---- */
 #include "hcsr04.h"
@@ -27,9 +25,10 @@ static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 /* --------------------------------- */
 
 static const char *TAG = "retro-fit";
-static esp_timer_handle_t s_post_timer;
-static QueueHandle_t      s_reading_queue;
-static TaskHandle_t       s_post_task_handle;
+static esp_timer_handle_t         s_post_timer;
+static QueueHandle_t              s_reading_queue;
+static TaskHandle_t               s_post_task_handle;
+static const transport_driver_t  *s_transport;
 
 /* Each queued reading carries a device-boot-relative timestamp so the server
  * can reconstruct wall-clock time for every sample in a batch. */
@@ -70,15 +69,20 @@ static void sensor_task(void *arg)
 /*  HTTP batch POST                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Max body: 30 readings × ~50 chars + 40-char envelope ≈ 1540 bytes */
-#define BATCH_BUF_SZ  1600
+/*
+ * Per-reading budget: {"v":650.0,"t":4294967295}, = 27 chars worst-case.
+ * Envelope: {"device":"retro-fit","sensor":"us","readings":[]} = 50 chars.
+ * 30 × 27 + 50 = 860 → 900 gives comfortable headroom.
+ */
+#define BATCH_BUF_SZ  900
 
 static void http_post_batch(const reading_t *batch, int count)
 {
     static char body[BATCH_BUF_SZ];
 
     int pos = snprintf(body, sizeof(body),
-                       "{\"device\":\"retro-fit\",\"readings\":[");
+                       "{\"device\":\"retro-fit\",\"sensor\":\"%s\",\"readings\":[",
+                       SENSOR_TYPE_TAG);
     for (int i = 0; i < count; i++) {
         const reading_t *r = &batch[i];
         /* Reserve 4 bytes for closing "]}" and null terminator */
@@ -89,12 +93,11 @@ static void http_post_batch(const reading_t *batch, int count)
         }
         if (r->distance_mm == DISTANCE_SENSOR_ERR) {
             pos += snprintf(body + pos, room,
-                            "{\"distance_cm\":null,\"timestamp_ms\":%"PRIu32"}",
+                            "{\"v\":null,\"t\":%"PRIu32"}",
                             r->timestamp_ms);
         } else {
             pos += snprintf(body + pos, room,
-                            "{\"distance_cm\":%"PRId32".%"PRId32
-                            ",\"timestamp_ms\":%"PRIu32"}",
+                            "{\"v\":%"PRId32".%"PRId32",\"t\":%"PRIu32"}",
                             r->distance_mm / 10, r->distance_mm % 10,
                             r->timestamp_ms);
         }
@@ -102,22 +105,10 @@ static void http_post_batch(const reading_t *batch, int count)
     }
     snprintf(body + pos, sizeof(body) - pos, "]}");
 
-    esp_http_client_config_t cfg = {
-        .url    = POST_URL,
-        .method = HTTP_METHOD_POST,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, body, strlen(body));
-
-    esp_err_t err = esp_http_client_perform(client);
+    esp_err_t err = s_transport->post(POST_URL, body, strlen(body));
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "POST %d — %d readings flushed",
-                 esp_http_client_get_status_code(client), count);
-    } else {
-        ESP_LOGE(TAG, "POST failed: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "batch of %d readings flushed", count);
     }
-    esp_http_client_cleanup(client);
 }
 
 /* ------------------------------------------------------------------ */
@@ -126,10 +117,8 @@ static void http_post_batch(const reading_t *batch, int count)
 
 static void post_timer_cb(void *arg)
 {
-    tcpip_adapter_ip_info_t ip;
-    if (tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip) != ESP_OK
-            || ip.ip.addr == 0) {
-        ESP_LOGW(TAG, "No IP yet, skipping POST");
+    if (!s_transport->is_ready()) {
+        ESP_LOGW(TAG, "transport not ready, skipping POST");
         return;
     }
     xTaskNotifyGive(s_post_task_handle);
@@ -167,6 +156,8 @@ void app_main(void)
     s_reading_queue = xQueueCreate(READING_QUEUE_DEPTH, sizeof(reading_t));
     configASSERT(s_reading_queue);
 
+    s_transport = transport_get();
+
     ESP_ERROR_CHECK(s_sensor->init());
     /* Priority 8: above httpd/dns (5) so the echo pulse busy-wait is not
      * preempted mid-measurement; well below WiFi stack tasks (~23). */
@@ -174,7 +165,7 @@ void app_main(void)
     /* Priority 5: HTTP can block for seconds without affecting the sensor. */
     xTaskCreate(post_task, "post", 4096, NULL, 5, &s_post_task_handle);
 
-    ESP_ERROR_CHECK(wifi_manager_init());
+    ESP_ERROR_CHECK(s_transport->init());
 
     const esp_timer_create_args_t timer_args = {
         .callback = post_timer_cb,
