@@ -196,11 +196,11 @@
     return d.toLocaleTimeString('en-GB', { hour12: false });
   }
 
-  /** Push one {id, device, distance_cm, recorded_at} row onto the chart. */
+  /** Push one {id, device, sensor_type, value, recorded_at} row onto the chart. */
   function addPoint(row) {
     chartData.labels.push(toHMS(row.recorded_at));
     chartData.datasets[0].data.push(
-      typeof row.distance_cm === 'number' ? row.distance_cm : null
+      typeof row.value === 'number' ? row.value : null
     );
 
     // Trim to MAX_POINTS
@@ -214,8 +214,8 @@
 
   /** Update the "current reading" card. */
   function updateCard(row) {
-    if (typeof row.distance_cm === 'number') {
-      currentValueEl.textContent = row.distance_cm.toFixed(1) + ' cm';
+    if (typeof row.value === 'number') {
+      currentValueEl.textContent = row.value.toFixed(1) + ' cm';
       currentValueEl.classList.remove('out-of-range');
     } else {
       currentValueEl.textContent = 'Out of range';

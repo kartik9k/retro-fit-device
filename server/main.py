@@ -67,11 +67,32 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS readings (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 device      TEXT    NOT NULL,
-                distance_cm REAL,
+                sensor_type TEXT    NOT NULL DEFAULT 'us',
+                value       REAL,
                 recorded_at TEXT    NOT NULL
             )
             """
         )
+        # Migrate from the old schema (distance_cm column) to the new one.
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(readings)").fetchall()}
+        if "distance_cm" in cols:
+            logger.info("Migrating readings table to new schema")
+            conn.executescript(
+                """
+                CREATE TABLE readings_new (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device      TEXT    NOT NULL,
+                    sensor_type TEXT    NOT NULL DEFAULT 'us',
+                    value       REAL,
+                    recorded_at TEXT    NOT NULL
+                );
+                INSERT INTO readings_new (id, device, sensor_type, value, recorded_at)
+                    SELECT id, device, 'us', distance_cm, recorded_at FROM readings;
+                DROP TABLE readings;
+                ALTER TABLE readings_new RENAME TO readings;
+                """
+            )
+            logger.info("Migration complete")
     logger.info("Database ready at %s", DB_PATH)
 
 
@@ -81,12 +102,13 @@ def init_db() -> None:
 
 
 class SingleReading(BaseModel):
-    distance_cm: Optional[float] = None
-    timestamp_ms: int  # ms since device boot; used to reconstruct wall-clock time
+    v: Optional[float] = None   # sensor value; unit implied by batch-level sensor tag
+    t: int                       # ms since device boot; used to reconstruct wall-clock time
 
 
 class BatchReading(BaseModel):
     device: str
+    sensor: str                  # short sensor-type tag, e.g. "us" for ultrasonic
     readings: list[SingleReading]
 
     @field_validator("device")
@@ -100,7 +122,8 @@ class BatchReading(BaseModel):
 class ReadingOut(BaseModel):
     id: int
     device: str
-    distance_cm: Optional[float]
+    sensor_type: str
+    value: Optional[float]
     recorded_at: str
 
 
@@ -150,33 +173,35 @@ def ingest_reading(batch: BatchReading):
     if not batch.readings:
         return {"inserted": 0, "ids": []}
 
-    # The most-recent reading's timestamp_ms corresponds to "now" on the device.
+    # The most-recent reading's t corresponds to "now" on the device.
     # Back-compute each reading's wall-clock time from the relative offsets so
     # that per-sample times are faithful even when readings arrive in a batch.
     now = datetime.now(timezone.utc)
-    latest_ts = max(r.timestamp_ms for r in batch.readings)
+    latest_ts = max(r.t for r in batch.readings)
 
     inserted = []
     with get_db() as conn:
         for r in batch.readings:
-            delta_ms = latest_ts - r.timestamp_ms
+            delta_ms = latest_ts - r.t
             recorded_at = (now - timedelta(milliseconds=delta_ms)).isoformat()
             cursor = conn.execute(
-                "INSERT INTO readings (device, distance_cm, recorded_at) VALUES (?, ?, ?)",
-                (batch.device, r.distance_cm, recorded_at),
+                "INSERT INTO readings (device, sensor_type, value, recorded_at) VALUES (?, ?, ?, ?)",
+                (batch.device, batch.sensor, r.v, recorded_at),
             )
             inserted.append({
                 "id": cursor.lastrowid,
                 "device": batch.device,
-                "distance_cm": r.distance_cm,
+                "sensor_type": batch.sensor,
+                "value": r.v,
                 "recorded_at": recorded_at,
             })
 
     logger.info(
-        "Batch of %d readings stored — device=%r  span=%.1f s",
+        "Batch of %d readings stored — device=%r  sensor=%r  span=%.1f s",
         len(inserted),
         batch.device,
-        (latest_ts - min(r.timestamp_ms for r in batch.readings)) / 1000.0,
+        batch.sensor,
+        (latest_ts - min(r.t for r in batch.readings)) / 1000.0,
     )
 
     for row in inserted:
@@ -198,14 +223,14 @@ def get_readings(
     with get_db() as conn:
         if device:
             rows = conn.execute(
-                "SELECT id, device, distance_cm, recorded_at "
+                "SELECT id, device, sensor_type, value, recorded_at "
                 "FROM readings WHERE device = ? "
                 "ORDER BY id DESC LIMIT ?",
                 (device, limit),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, device, distance_cm, recorded_at "
+                "SELECT id, device, sensor_type, value, recorded_at "
                 "FROM readings ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
