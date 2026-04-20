@@ -11,7 +11,7 @@
 
 ESP8266 firmware that reads distance from an HC-SR04 ultrasonic sensor and
 POSTs batched readings over Wi-Fi (or, in future, cellular) to a companion
-FastAPI server. The ESP8266 RTOS SDK lives in `esp8266-rtos-sdk/` as a
+FastAPI server. The ESP8266 RTOS SDK lives in `firmware/esp8266-rtos-sdk/` as a
 submodule — no external SDK installation is required.
 
 ---
@@ -28,6 +28,8 @@ submodule — no external SDK installation is required.
 ### Build
 
 ```bash
+cd firmware
+
 # First-time: initialise the SDK submodule
 git submodule update --init --recursive
 
@@ -47,9 +49,10 @@ make flash monitor
 make monitor
 ```
 
-Build artefacts land in `build/`. `sdkconfig` holds the active configuration;
-`sdkconfig.defaults` seeds it on first run (currently only raises
-`CONFIG_HTTPD_MAX_REQ_HDR_LEN` to 1024 to accommodate iOS captive-portal headers).
+Build artefacts land in `firmware/build/`. `firmware/sdkconfig` holds the
+active configuration; `firmware/sdkconfig.defaults` seeds it on first run
+(currently only raises `CONFIG_HTTPD_MAX_REQ_HDR_LEN` to 1024 to accommodate
+iOS captive-portal headers).
 
 ### Key configuration constants (`main/app_main.c`)
 
@@ -57,7 +60,7 @@ These must be reviewed before flashing to a new deployment:
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `POST_URL` | `http://192.168.1.65:5000/api/data` | **Must match the server's LAN IP.** Find it with: `ip route get 1 \| awk '{print $7; exit}'` |
+| `POST_URL` | `http://192.168.1.65:5000/api/data` | **Must match the server's LAN IP.** Find it with: `ip route get 1 \| awk '{print $7; exit}'`. Set in `firmware/main/app_main.c`. |
 | `POST_PERIOD_US` | 30 000 000 µs (30 s) | How often the batch POST fires |
 | `SENSOR_PERIOD_MS` | 2 000 ms | HC-SR04 sampling interval |
 | `READING_QUEUE_DEPTH` | 30 | Max readings buffered between POSTs (~60 s at 2 s/sample) |
@@ -81,7 +84,7 @@ These must be reviewed before flashing to a new deployment:
 
 ### Namespaces and keys
 
-#### `wifi_mgr` — managed by `main/wifi_manager.c`
+#### `wifi_mgr` — managed by `firmware/main/wifi_manager.c`
 
 | Key | Type | Max size | Default (absent) | Description |
 |-----|------|----------|------------------|-------------|
@@ -94,7 +97,7 @@ These must be reviewed before flashing to a new deployment:
 
 #### `transport` — *planned, not yet implemented* (see DEFERRED §4)
 
-> Managed by `main/transport.c` once implemented.
+> Managed by `firmware/main/transport.c` once implemented.
 
 | Key | Type | Max size | Default (absent) | Description |
 |-----|------|----------|------------------|-------------|
@@ -104,7 +107,7 @@ These must be reviewed before flashing to a new deployment:
 
 ### NVS key size constants
 
-Defined in `main/wifi_manager.c`:
+Defined in `firmware/main/wifi_manager.c`:
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
@@ -139,7 +142,7 @@ Defined in `main/wifi_manager.c`:
   `xTaskNotifyGive()` and never blocks. Any blocking operation in a timer
   callback will deadlock.
 
-### Transport abstraction (`main/transport.h`)
+### Transport abstraction (`firmware/main/transport.h`)
 
 All network drivers implement `transport_driver_t` — three function pointers:
 
@@ -149,16 +152,16 @@ All network drivers implement `transport_driver_t` — three function pointers:
 | `is_ready()` | No | Called from timer context; returns true when ready to POST |
 | `post(url, body, len)` | Yes | Sends an HTTP POST with a pre-built JSON body |
 
-`transport_get()` in `main/transport.c` returns the active driver. Currently
+`transport_get()` in `firmware/main/transport.c` returns the active driver. Currently
 always returns `&wifi_transport`; NVS-based runtime selection is deferred
 (see DEFERRED §4).
 
 **Drivers:**
-- `main/wifi_transport.c` — wraps `wifi_manager_init()` and `esp_http_client`
-- `main/cellular_transport.c` — stub returning `ESP_ERR_NOT_SUPPORTED`; real
+- `firmware/main/wifi_transport.c` — wraps `wifi_manager_init()` and `esp_http_client`
+- `firmware/main/cellular_transport.c` — stub returning `ESP_ERR_NOT_SUPPORTED`; real
   SIM7080G AT-command driver slots in here (see DEFERRED §1)
 
-### Sensor abstraction (`main/distance_sensor.h`)
+### Sensor abstraction (`firmware/main/distance_sensor.h`)
 
 All sensor drivers implement `distance_sensor_t` — two function pointers:
 
@@ -171,9 +174,9 @@ To swap sensors: change the `#include` and the `s_sensor` pointer in
 `app_main.c`. Also update `SENSOR_TYPE_TAG` in `distance_sensor.h` to match
 the new sensor's type string — this tag is included in every batch POST.
 
-**Current driver:** `main/hcsr04.c` — HC-SR04 ultrasonic, `SENSOR_TYPE_TAG = "us"`
+**Current driver:** `firmware/main/hcsr04.c` — HC-SR04 ultrasonic, `SENSOR_TYPE_TAG = "us"`
 
-### Wi-Fi provisioning flow (`main/wifi_manager.c`)
+### Wi-Fi provisioning flow (`firmware/main/wifi_manager.c`)
 
 **First boot** (no NVS credentials):
 1. Starts SoftAP named `retro-fit-XXXXXX` (last 3 MAC bytes, open network)

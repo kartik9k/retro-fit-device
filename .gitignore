@@ -1,6 +1,6 @@
-build/
-sdkconfig
-sdkconfig.old
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
 *.pyc
 __pycache__/
 .DS_Store

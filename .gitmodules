@@ -1,3 +1,3 @@
 [submodule "esp8266-rtos-sdk"]
-	path = esp8266-rtos-sdk
+	path = firmware/esp8266-rtos-sdk
 	url = https://github.com/espressif/esp8266_rtos_sdk.git

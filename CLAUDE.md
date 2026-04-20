@@ -11,7 +11,7 @@ documentation live in the agent-owned documents listed below.
 | Agent | Owns | Maintained document |
 |-------|------|---------------------|
 | **Product Manager** | Requirements, product vision, scope decisions | — |
-| **Firmware** | `main/` — FreeRTOS tasks, ESP8266 SDK, transport layer, NVS, build system | `FIRMWARE.md` |
+| **Firmware** | `firmware/` — FreeRTOS tasks, ESP8266 SDK, transport layer, NVS, build system | `FIRMWARE.md` |
 | **Hardware** | GPIO wiring, voltage levels, sensor selection, circuit design | `HARDWARE.md` |
 | **Server** | `server/` — FastAPI, SQLite schema, Pydantic models, SSE, deployment | `SERVER.md` |
 
