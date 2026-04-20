@@ -170,11 +170,45 @@ All sensor drivers implement `distance_sensor_t` — two function pointers:
 | `init()` | One-time hardware initialisation |
 | `read_mm()` | Trigger a measurement; returns mm or `DISTANCE_SENSOR_ERR` (`INT32_MIN`) on timeout/out-of-range |
 
-To swap sensors: change the `#include` and the `s_sensor` pointer in
-`app_main.c`. Also update `SENSOR_TYPE_TAG` in `distance_sensor.h` to match
-the new sensor's type string — this tag is included in every batch POST.
+`SENSOR_TYPE_TAG` (also in `distance_sensor.h`) is a short string included in
+every batch POST under the `sensor` field. Currently `"us"` for ultrasonic —
+both current drivers share this tag since the measurement principle is the same.
 
-**Current driver:** `firmware/main/hcsr04.c` — HC-SR04 ultrasonic, `SENSOR_TYPE_TAG = "us"`
+### Sensor configurations (hardware v1 and v2)
+
+Two sensor configurations are maintained. See `HARDWARE.md` § Hardware
+configurations for the full wiring and board-change details.
+
+| | **v1 — HC-SR04** | **v2 — DYP-A22** |
+|---|---|---|
+| Status | **Active** | Stub — hardware ordered, not received |
+| Driver | `firmware/main/hcsr04.c` | `firmware/main/dyp_a22.c` |
+| Interface | TRIG/ECHO pulse on GPIO5/GPIO4 | I2C on GPIO4 (SDA) / GPIO5 (SCL) |
+| Testable | Yes | Only when hardware arrives |
+
+#### Switching sensor configuration
+
+Edit the two marked lines in `firmware/main/app_main.c`:
+
+```c
+/* ---- active sensor: swap this include + pointer to change hardware ---- */
+// v1 — HC-SR04:
+#include "hcsr04.h"
+static const distance_sensor_t *s_sensor = &hcsr04_sensor;
+
+// v2 — DYP-A22 (hardware pending):
+// #include "dyp_a22.h"
+// static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
+/* ----------------------------------------------------------------------- */
+```
+
+No other files need to change. The `sensor_task` priority rationale differs
+between drivers:
+- **v1 (HC-SR04):** `sensor_task` at priority 8 is critical — the TRIG/ECHO
+  busy-wait must not be preempted mid-pulse.
+- **v2 (DYP-A22):** I2C is interrupt/DMA-driven; the busy-wait is gone. Priority
+  8 can be reduced once the driver is validated. Flag to Hardware Agent before
+  changing priority.
 
 ### Wi-Fi provisioning flow (`firmware/main/wifi_manager.c`)
 
