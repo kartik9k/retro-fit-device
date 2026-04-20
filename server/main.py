@@ -2,26 +2,35 @@
 HTTP logging service for ESP8266 retro-fit distance sensor device.
 
 Endpoints:
-  POST /api/data    - ingest a sensor reading
+  POST /api/data    - ingest a batch of sensor readings
   GET  /api/data    - retrieve recent readings
   GET  /api/stream  - SSE stream of new readings
   GET  /health      - liveness check
-  GET  /            - live visualizer UI
+  GET  /            - live visualiser UI
+
+Configuration (environment variables):
+  DATABASE_URL      - PostgreSQL connection string (required)
+                      e.g. postgresql://user:pass@host:5432/dbname
+                      Local dev: copy server/.env.example to server/.env
 """
 
 import asyncio
 import json
 import logging
-import sqlite3
-from contextlib import contextmanager
+import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
+import asyncpg
+from dotenv import load_dotenv
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -38,68 +47,70 @@ logger = logging.getLogger(__name__)
 # Database
 # ---------------------------------------------------------------------------
 
-DB_PATH = Path(__file__).parent / "readings.db"
+_pool: asyncpg.Pool | None = None
 
 
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-@contextmanager
-def get_db():
-    conn = _get_conn()
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-
-def init_db() -> None:
-    with get_db() as conn:
-        conn.execute(
+async def _init_db(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS readings (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                device      TEXT    NOT NULL,
-                sensor_type TEXT    NOT NULL DEFAULT 'us',
+                id          BIGSERIAL    PRIMARY KEY,
+                device      TEXT         NOT NULL,
+                sensor_type TEXT         NOT NULL DEFAULT 'us',
                 value       REAL,
-                recorded_at TEXT    NOT NULL
+                recorded_at TIMESTAMPTZ  NOT NULL
             )
             """
         )
-        # Migrate from the old schema (distance_cm column) to the new one.
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(readings)").fetchall()}
-        if "distance_cm" in cols:
-            logger.info("Migrating readings table to new schema")
-            conn.executescript(
-                """
-                CREATE TABLE readings_new (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device      TEXT    NOT NULL,
-                    sensor_type TEXT    NOT NULL DEFAULT 'us',
-                    value       REAL,
-                    recorded_at TEXT    NOT NULL
-                );
-                INSERT INTO readings_new (id, device, sensor_type, value, recorded_at)
-                    SELECT id, device, 'us', distance_cm, recorded_at FROM readings;
-                DROP TABLE readings;
-                ALTER TABLE readings_new RENAME TO readings;
-                """
-            )
-            logger.info("Migration complete")
-    logger.info("Database ready at %s", DB_PATH)
+        await conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS readings_device_recorded
+            ON readings (device, recorded_at DESC)
+            """
+        )
+    logger.info("Database ready")
+
+
+# ---------------------------------------------------------------------------
+# SSE fan-out — one asyncio.Queue per connected client
+# ---------------------------------------------------------------------------
+
+_sse_subscribers: dict[str, set[asyncio.Queue]] = {}
+
+
+def _publish(device: str, row: dict) -> None:
+    queues = _sse_subscribers.get(device, set())
+    payload = json.dumps(row)
+    for q in list(queues):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            pass  # slow client — drop rather than block
+
+
+# ---------------------------------------------------------------------------
+# App lifespan — pool open/close
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pool
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. "
+            "Copy server/.env.example to server/.env and fill in the value."
+        )
+    _pool = await asyncpg.create_pool(database_url, min_size=2, max_size=10)
+    await _init_db(_pool)
+    yield
+    await _pool.close()
 
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
 
 class SingleReading(BaseModel):
     v: Optional[float] = None   # sensor value; unit implied by batch-level sensor tag
@@ -128,73 +139,49 @@ class ReadingOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# SSE fan-out — one asyncio.Queue per connected client
-# ---------------------------------------------------------------------------
-
-# Maps device name -> set of queues for connected SSE clients.
-# Using a plain dict of sets; keys are created on first subscribe.
-_sse_subscribers: dict[str, set[asyncio.Queue]] = {}
-
-
-def _publish(device: str, row: dict) -> None:
-    """Called from the synchronous POST handler to fan-out a new row."""
-    queues = _sse_subscribers.get(device, set())
-    payload = json.dumps(row)
-    for q in list(queues):
-        try:
-            q.put_nowait(payload)
-        except asyncio.QueueFull:
-            pass  # slow client — skip rather than block
-
-
-# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="ESP8266 Sensor Logger", version="1.0.0")
+app = FastAPI(title="ESP8266 Sensor Logger", version="1.0.0", lifespan=lifespan)
 
-STATIC_DIR = Path(__file__).parent / "static"
+STATIC_DIR = ((__import__("pathlib").Path(__file__).parent) / "static")
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    init_db()
 
 
 # ---------------------------------------------------------------------------
 # POST /api/data
 # ---------------------------------------------------------------------------
 
-
 @app.post("/api/data", status_code=201)
-def ingest_reading(batch: BatchReading):
+async def ingest_reading(batch: BatchReading):
     if not batch.readings:
         return {"inserted": 0, "ids": []}
 
-    # The most-recent reading's t corresponds to "now" on the device.
-    # Back-compute each reading's wall-clock time from the relative offsets so
-    # that per-sample times are faithful even when readings arrive in a batch.
     now = datetime.now(timezone.utc)
     latest_ts = max(r.t for r in batch.readings)
 
     inserted = []
-    with get_db() as conn:
-        for r in batch.readings:
-            delta_ms = latest_ts - r.t
-            recorded_at = (now - timedelta(milliseconds=delta_ms)).isoformat()
-            cursor = conn.execute(
-                "INSERT INTO readings (device, sensor_type, value, recorded_at) VALUES (?, ?, ?, ?)",
-                (batch.device, batch.sensor, r.v, recorded_at),
-            )
-            inserted.append({
-                "id": cursor.lastrowid,
-                "device": batch.device,
-                "sensor_type": batch.sensor,
-                "value": r.v,
-                "recorded_at": recorded_at,
-            })
+    async with _pool.acquire() as conn:
+        async with conn.transaction():
+            for r in batch.readings:
+                delta_ms = latest_ts - r.t
+                recorded_at = now - timedelta(milliseconds=delta_ms)
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO readings (device, sensor_type, value, recorded_at)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    """,
+                    batch.device, batch.sensor, r.v, recorded_at,
+                )
+                inserted.append({
+                    "id": row["id"],
+                    "device": batch.device,
+                    "sensor_type": batch.sensor,
+                    "value": r.v,
+                    "recorded_at": recorded_at.isoformat(),
+                })
 
     logger.info(
         "Batch of %d readings stored — device=%r  sensor=%r  span=%.1f s",
@@ -214,54 +201,63 @@ def ingest_reading(batch: BatchReading):
 # GET /api/data
 # ---------------------------------------------------------------------------
 
-
 @app.get("/api/data", response_model=list[ReadingOut])
-def get_readings(
+async def get_readings(
     device: Optional[str] = Query(default=None, description="Filter by device name"),
-    limit: int = Query(default=100, ge=1, le=1000, description="Max rows to return (1-1000)"),
+    limit: int = Query(default=100, ge=1, le=1000, description="Max rows to return"),
 ):
-    with get_db() as conn:
+    async with _pool.acquire() as conn:
         if device:
-            rows = conn.execute(
-                "SELECT id, device, sensor_type, value, recorded_at "
-                "FROM readings WHERE device = ? "
-                "ORDER BY id DESC LIMIT ?",
-                (device, limit),
-            ).fetchall()
+            rows = await conn.fetch(
+                """
+                SELECT id, device, sensor_type, value, recorded_at
+                FROM readings
+                WHERE device = $1
+                ORDER BY recorded_at DESC
+                LIMIT $2
+                """,
+                device, limit,
+            )
         else:
-            rows = conn.execute(
-                "SELECT id, device, sensor_type, value, recorded_at "
-                "FROM readings ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = await conn.fetch(
+                """
+                SELECT id, device, sensor_type, value, recorded_at
+                FROM readings
+                ORDER BY recorded_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
 
-    return [dict(row) for row in rows]
+    return [
+        {**dict(row), "recorded_at": row["recorded_at"].isoformat()}
+        for row in rows
+    ]
 
 
 # ---------------------------------------------------------------------------
 # GET /health
 # ---------------------------------------------------------------------------
 
-
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
-# GET /api/stream  — Server-Sent Events
+# GET /api/stream — Server-Sent Events
 # ---------------------------------------------------------------------------
-
 
 @app.get("/api/stream")
 async def stream_readings(
     device: str = Query(default="retro-fit", description="Device name to subscribe to"),
 ):
     queue: asyncio.Queue = asyncio.Queue(maxsize=128)
-
-    # Register this client
     _sse_subscribers.setdefault(device, set()).add(queue)
-    logger.info("SSE client connected for device=%r  (total=%d)", device, len(_sse_subscribers[device]))
+    logger.info(
+        "SSE client connected for device=%r  (total=%d)",
+        device, len(_sse_subscribers[device]),
+    )
 
     async def event_generator():
         try:
@@ -274,8 +270,7 @@ async def stream_readings(
             _sse_subscribers[device].discard(queue)
             logger.info(
                 "SSE client disconnected for device=%r  (remaining=%d)",
-                device,
-                len(_sse_subscribers.get(device, set())),
+                device, len(_sse_subscribers.get(device, set())),
             )
 
     return StreamingResponse(
@@ -283,29 +278,23 @@ async def stream_readings(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if behind a proxy
+            "X-Accel-Buffering": "no",
         },
     )
 
 
 # ---------------------------------------------------------------------------
-# GET /  — live visualizer
+# GET / — live visualiser
 # ---------------------------------------------------------------------------
-
 
 @app.get("/")
 async def index():
-    from fastapi.responses import FileResponse
     return FileResponse(STATIC_DIR / "index.html")
 
 
 # ---------------------------------------------------------------------------
-# Custom 422 handler — surface Pydantic validation messages clearly
+# Custom 422 handler
 # ---------------------------------------------------------------------------
-
-
-from fastapi.exceptions import RequestValidationError
-
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc: RequestValidationError):
@@ -321,5 +310,4 @@ async def validation_exception_handler(request, exc: RequestValidationError):
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=False)
