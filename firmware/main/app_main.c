@@ -17,8 +17,16 @@
 static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 /* ----------------------------------------------------------------------- */
 
-/* ---------- user config ---------- */
-#define POST_URL            "http://192.168.1.65:5000/api/data"
+/* ---------- user config ----------
+ * POST_URL: uncomment the line that matches your deployment mode.
+ *   Mode 1 — LAN  : device and server on the same Wi-Fi network.
+ *   Mode 3 — Azure: device posts over the internet to the cloud server.
+ *                   Requires the TLS CA cert in wifi_transport.c to match
+ *                   the server's certificate chain (Let's Encrypt / ISRG Root X1).
+ */
+// #define POST_URL  "http://192.168.1.65:5000/api/data"           /* Mode 1 — LAN  */
+#define POST_URL     "https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data"  /* Mode 3 — Azure */
+
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 #define READING_QUEUE_DEPTH 30                       /* ~60 s at 2 s/sample */

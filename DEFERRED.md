@@ -211,24 +211,10 @@ zero-config while preserving the ability to scope data later.
 
 ## 10. HTTPS in firmware
 
-**Why deferred:** `POST_URL` currently uses `http://`. Production hosting always
-terminates with HTTPS. The ESP8266 `esp_http_client` supports HTTPS but requires
-a PEM-encoded CA certificate bundle embedded in flash.
-
-**This is a cross-boundary change** — it requires simultaneous updates to:
-- Firmware: embed CA cert (`CONFIG_ESP_TLS_CERTIFICATE_BUNDLE` or a single PEM
-  in `main/certs/`), change `POST_URL` to `https://`.
-- `API_CONTRACT.md`: update base URL, note TLS requirement.
-- Server: ensure TLS termination is configured on the hosting platform.
-
-All three must land in one atomic commit per the Firmware ↔ Server notification
-rule.
-
-**What must be true before implementing:**
-- Cloud hosting (item 7) confirmed and HTTPS endpoint URL known.
-- CA bundle source identified: ESP-IDF ships `esp_crt_bundle` which covers most
-  public CAs (Let's Encrypt included). Verify the bundle is compatible with the
-  hosting platform's certificate chain.
+**Status: IMPLEMENTED** — ISRG Root X1 CA cert embedded as a string constant in
+`firmware/main/wifi_transport.c`. `POST_URL` in `app_main.c` has both Mode 1
+(LAN HTTP) and Mode 3 (Azure HTTPS) options as comments — uncomment the target
+before building. `API_CONTRACT.md` updated with both base URLs.
 
 ---
 

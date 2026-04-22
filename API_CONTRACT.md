@@ -16,9 +16,11 @@
 |-------|-------|
 | Method | `POST` |
 | Path | `/api/data` |
-| Base URL (configurable) | `http://<server-lan-ip>:5000` |
+| Base URL — Mode 1 (LAN) | `http://<server-lan-ip>:5000` — plain HTTP, device and server on same Wi-Fi |
+| Base URL — Mode 3 (Azure) | `https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io` |
 | Content-Type | `application/json` |
 | Auth | None |
+| TLS | Required for Mode 3. Firmware embeds ISRG Root X1 CA cert in `wifi_transport.c`. Replace cert if server moves away from Let's Encrypt. |
 
 ---
 
@@ -107,3 +109,4 @@ The SSE payload is a single JSON object matching `ReadingOut`. This is not negot
 |------|--------|-----------|-----------|
 | 2026-04-20 | Initial contract documented — batch JSON format with `timestamp_ms` | Firmware Agent | Server Agent |
 | 2026-04-20 | Payload optimisation: `distance_cm`→`v`, `timestamp_ms`→`t`, add `sensor` field; `BATCH_BUF_SZ` 1600→900; DB columns `distance_cm`→`value`, add `sensor_type` | Server Agent | Firmware Agent |
+| 2026-04-21 | Add Mode 3 Azure HTTPS base URL; TLS via ISRG Root X1 CA cert embedded in firmware; Mode 1 LAN HTTP unchanged | Firmware Agent | Server Agent |
