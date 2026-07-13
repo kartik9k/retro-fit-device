@@ -113,13 +113,14 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 
 class SingleReading(BaseModel):
-    v: Optional[float] = None   # sensor value; unit implied by batch-level sensor tag
+    k: str                       # sensor-type tag for this reading, e.g. "us" for ultrasonic
+    v: Optional[float] = None   # sensor value; unit implied by k
     t: int                       # ms since device boot; used to reconstruct wall-clock time
 
 
 class BatchReading(BaseModel):
+    proto: Optional[str] = None  # protocol version string, e.g. "1.0"; absent in pre-versioning firmware
     device: str
-    sensor: str                  # short sensor-type tag, e.g. "us" for ultrasonic
     readings: list[SingleReading]
 
     @field_validator("device")
@@ -173,21 +174,21 @@ async def ingest_reading(batch: BatchReading):
                     VALUES ($1, $2, $3, $4)
                     RETURNING id
                     """,
-                    batch.device, batch.sensor, r.v, recorded_at,
+                    batch.device, r.k, r.v, recorded_at,
                 )
                 inserted.append({
                     "id": row["id"],
                     "device": batch.device,
-                    "sensor_type": batch.sensor,
+                    "sensor_type": r.k,
                     "value": r.v,
                     "recorded_at": recorded_at.isoformat(),
                 })
 
     logger.info(
-        "Batch of %d readings stored — device=%r  sensor=%r  span=%.1f s",
+        "Batch of %d readings stored — device=%r  keys=%s  span=%.1f s",
         len(inserted),
         batch.device,
-        batch.sensor,
+        sorted({r.k for r in batch.readings}),
         (latest_ts - min(r.t for r in batch.readings)) / 1000.0,
     )
 

@@ -148,8 +148,8 @@ instance alive at all times. Scaling to zero would drop all open SSE connections
 
 | Model | Direction | Fields |
 |-------|-----------|--------|
-| `SingleReading` | Inbound (per reading) | `v: float\|null`, `t: int` |
-| `BatchReading` | Inbound (full POST body) | `device: str`, `sensor: str`, `readings: list[SingleReading]` |
+| `SingleReading` | Inbound (per reading) | `k: str`, `v: float\|null`, `t: int` |
+| `BatchReading` | Inbound (full POST body) | `proto: str\|null`, `device: str`, `readings: list[SingleReading]` |
 | `ReadingOut` | Outbound (GET + SSE) | `id`, `device`, `sensor_type`, `value`, `recorded_at` |
 
 Wire format is defined in `API_CONTRACT.md` — do not change models without

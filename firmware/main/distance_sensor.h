@@ -27,8 +27,8 @@ typedef struct {
 #define DISTANCE_SENSOR_ERR  INT32_MIN
 
 /*
- * Short sensor-type tag included in every batch POST under the "sensor" key.
+ * Short sensor-type tag included in every reading under the "k" key.
  * Override this in the active sensor's header if needed; app_main.c reads it
  * via the #include of the active sensor header.
  */
-#define SENSOR_TYPE_TAG  "us"   /* ultrasonic */
+#define SENSOR_TYPE_TAG  "us"   /* ultrasonic — see reading key registry in API_CONTRACT.md */

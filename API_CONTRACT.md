@@ -28,13 +28,12 @@
 
 ```json
 {
-  "proto": 1,
+  "proto": "1.0",
   "device": "retro-fit",
-  "sensor": "us",
   "readings": [
-    { "v": 12.3,  "t": 360000 },
-    { "v": null,  "t": 362000 },
-    { "v": 12.5,  "t": 364000 }
+    { "k": "us", "v": 12.3,  "t": 360000 },
+    { "k": "us", "v": null,  "t": 362000 },
+    { "k": "us", "v": 12.5,  "t": 364000 }
   ],
   "events": [
     { "k": "i2c_health",    "v": true,       "t": 360000 },
@@ -48,14 +47,14 @@
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `proto` | `integer` | Yes | Protocol major version. Current value: `1`. Server rejects with `400` if the value exceeds the highest version it supports. Absent in pre-versioning firmware — server must treat absence as `1`. Defined in firmware as `PROTO_VERSION` in `app_main.c`. |
+| `proto` | `string` | Yes | Protocol version (`"major.minor"`). Current value: `"1.0"`. Minor bump = additive change, server can still parse. Major bump = breaking, server rejects with `400`. Absent in pre-versioning firmware — server treats absence as `"1.0"`. Defined in firmware as `PROTO_VERSION` in `app_main.c`. |
 | `device` | `string` | Yes | Non-empty device identifier. Fixed value `"retro-fit"` in current firmware. |
-| `sensor` | `string` | Yes | Short sensor-type tag. Current values: `"us"` (DYP-A22 ultrasonic). New sensor modules add a new tag here — no other field changes required. Defined in firmware as `SENSOR_TYPE_TAG` in `distance_sensor.h`. |
-| `readings` | `array` | Yes | Ordered list of samples, oldest first. May be empty (server returns 0 inserts). |
-| `readings[].v` | `number \| null` | Yes | Sensor value in the unit implied by `sensor` (cm for `"us"`). `null` when sensor returned out-of-range or timeout. |
+| `readings` | `array` | Yes | Ordered list of samples, oldest first. May be empty (server returns 0 inserts). Multiple sensor types may be mixed in one batch. |
+| `readings[].k` | `string` | Yes | Sensor-type key for this reading. Must be a value from the reading key registry below. Defined in firmware as `SENSOR_TYPE_TAG` in `distance_sensor.h`. |
+| `readings[].v` | `number \| null` | Yes | Sensor value. Unit is determined by `k` — see registry. `null` when sensor returned out-of-range or timeout. |
 | `readings[].t` | `integer` | Yes | Milliseconds since device boot (`esp_timer_get_time() / 1000`). Monotonically increasing within a batch. Wraps at ~49.7 days. |
 | `events` | `array` | No | Device telemetry and health events. Omitted entirely when there are no events to report. Order is not significant. |
-| `events[].k` | `string` | Yes | Event key. Must be a value from the key registry below. |
+| `events[].k` | `string` | Yes | Event key. Must be a value from the event key registry below. |
 | `events[].v` | `bool \| number \| string \| null` | Yes | Event value. Type is determined by the key — see registry. |
 | `events[].t` | `integer` | Yes | Same semantics as `readings[].t` — ms since device boot. |
 
@@ -63,9 +62,19 @@
 
 - `readings[].v` is formatted as `%d.%d` using integer mm arithmetic: `mm/10` . `mm%10`. This produces one decimal digit (e.g. `12.3`, `0.5`, `650.0`). The server must treat it as a float, not a fixed-precision decimal.
 - `t` is cast from `int64_t` to `uint32_t`. Relative differences within a single batch are always < 30 s so wrap-around never affects delta computation.
-- Batch size: up to `READING_QUEUE_DEPTH` (currently 30) readings per POST. The firmware caps the JSON body at `BATCH_BUF_SZ` (currently 900 bytes) and logs a warning if truncated.
+- Batch size: up to `READING_QUEUE_DEPTH` (currently 30) readings per POST. The firmware caps the JSON body at `BATCH_BUF_SZ` (currently 1300 bytes) and logs a warning if truncated.
 - POST period: every `POST_PERIOD_US` (currently 30 s).
 - **When to send each event is a firmware implementation detail and is not part of this contract.** The server must handle any key appearing zero or more times per POST without error.
+
+---
+
+## Reading key registry
+
+Both sides must agree before adding a new key. Adding a key requires a change-log entry here.
+
+| Key | Value unit | Description |
+|-----|------------|-------------|
+| `us` | cm, 1 decimal place | Ultrasonic distance (DYP-A22). `null` on out-of-range or sensor error. |
 
 ---
 
@@ -137,4 +146,5 @@ The SSE payload is a single JSON object matching `ReadingOut`. This is not negot
 | 2026-04-20 | Payload optimisation: `distance_cm`→`v`, `timestamp_ms`→`t`, add `sensor` field; `BATCH_BUF_SZ` 1600→900; DB columns `distance_cm`→`value`, add `sensor_type` | Server Agent | Firmware Agent |
 | 2026-04-21 | Add Mode 3 Azure HTTPS base URL; TLS via ISRG Root X1 CA cert embedded in firmware; Mode 1 LAN HTTP unchanged | Firmware Agent | Server Agent |
 | 2026-07-13 | Add optional `events` array for device telemetry; define event key registry (`i2c_health`, `rssi`, `heap_free`, `reboot_reason`, `post_failures`); send frequency is firmware implementation detail and not part of contract | Firmware Agent | Server Agent |
-| 2026-07-13 | Add `proto` integer field (major protocol version); current value `1`; server treats absence as `1` for backward compat; rejects unsupported versions with `400` | Firmware Agent | Server Agent |
+| 2026-07-13 | Add `proto` version string (`"major.minor"`); current value `"1.0"`; server treats absence as `"1.0"`; rejects unknown major with `400` | Firmware Agent | Server Agent |
+| 2026-07-13 | Remove batch-level `sensor` field; add per-reading `k` key (sensor type tag); add reading key registry (`us`); multiple sensor types can now coexist in one batch | Firmware Agent | Server Agent |

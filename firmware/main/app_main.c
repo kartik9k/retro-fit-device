@@ -32,7 +32,7 @@ static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
 // #define POST_URL  "http://192.168.1.65:5000/api/data"           /* Mode 1 — LAN  */
 #define POST_URL     "https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data"  /* Mode 3 — Azure */
 
-#define PROTO_VERSION       1                        /* increment on breaking wire-format changes */
+#define PROTO_VERSION       "1.0"                    /* major.minor — increment minor on additive changes, major on breaking ones */
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 #define READING_QUEUE_DEPTH 30                       /* ~60 s at 2 s/sample */
@@ -84,19 +84,19 @@ static void sensor_task(void *arg)
 /* ------------------------------------------------------------------ */
 
 /*
- * Per-reading budget: {"v":650.0,"t":4294967295}, = 27 chars worst-case.
- * Envelope: {"proto":1,"device":"retro-fit","sensor":"us","readings":[]} = 62 chars.
- * 30 × 27 + 62 = 872 → 900 gives comfortable headroom.
+ * Per-reading worst case: {"k":"us","v":650.0,"t":4294967295}, = 36 chars.
+ * Envelope: {"proto":"1.0","device":"retro-fit","readings":[]} = 50 chars.
+ * 30 × 36 + 50 = 1130 → 1300 gives headroom for future events array.
  */
-#define BATCH_BUF_SZ  900
+#define BATCH_BUF_SZ  1300
 
 static void http_post_batch(const reading_t *batch, int count)
 {
     static char body[BATCH_BUF_SZ];
 
     int pos = snprintf(body, sizeof(body),
-                       "{\"proto\":%d,\"device\":\"retro-fit\",\"sensor\":\"%s\",\"readings\":[",
-                       PROTO_VERSION, SENSOR_TYPE_TAG);
+                       "{\"proto\":\"%s\",\"device\":\"retro-fit\",\"readings\":[",
+                       PROTO_VERSION);
     for (int i = 0; i < count; i++) {
         const reading_t *r = &batch[i];
         /* Reserve 4 bytes for closing "]}" and null terminator */
@@ -107,11 +107,12 @@ static void http_post_batch(const reading_t *batch, int count)
         }
         if (r->distance_mm == DISTANCE_SENSOR_ERR) {
             pos += snprintf(body + pos, room,
-                            "{\"v\":null,\"t\":%"PRIu32"}",
-                            r->timestamp_ms);
+                            "{\"k\":\"%s\",\"v\":null,\"t\":%"PRIu32"}",
+                            SENSOR_TYPE_TAG, r->timestamp_ms);
         } else {
             pos += snprintf(body + pos, room,
-                            "{\"v\":%"PRId32".%"PRId32",\"t\":%"PRIu32"}",
+                            "{\"k\":\"%s\",\"v\":%"PRId32".%"PRId32",\"t\":%"PRIu32"}",
+                            SENSOR_TYPE_TAG,
                             r->distance_mm / 10, r->distance_mm % 10,
                             r->timestamp_ms);
         }
