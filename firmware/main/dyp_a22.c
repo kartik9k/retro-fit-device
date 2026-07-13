@@ -22,7 +22,6 @@
 #define DYP_MEASURE_MS          80          /* datasheet minimum before result is valid */
 #define DYP_TIMEOUT_TICKS       (100 / portTICK_RATE_MS)
 #define DYP_MUTEX_WAIT_TICKS    (50  / portTICK_RATE_MS)
-#define DYP_RESULT_WAIT_TICKS   (500 / portTICK_RATE_MS)   /* large enough to absorb a health scan */
 
 /* Change this value to adjust the periodic I2C bus health-check interval */
 #define DYP_HEALTH_SCAN_MS      (60UL * 60UL * 1000UL)     /* 1 hour */
@@ -30,10 +29,10 @@
 static const char *TAG = "dyp_a22";
 
 static SemaphoreHandle_t s_bus_mutex;    /* serialises every I2C transaction */
-static SemaphoreHandle_t s_result_sem;   /* given by the pipeline each time a result lands */
+static SemaphoreHandle_t s_val_mutex;    /* protects s_last_mm */
 static TimerHandle_t     s_meas_timer;   /* one-shot: fires DYP_MEASURE_MS after each trigger */
 static TimerHandle_t     s_health_timer; /* periodic: I2C bus health scan */
-static volatile int32_t  s_last_mm = DISTANCE_SENSOR_ERR;
+static int32_t           s_last_mm = DISTANCE_SENSOR_ERR;
 
 /* Caller must hold s_bus_mutex.
  * Returns true if DYP_I2C_ADDR (0x74) acknowledged — used by health_scan_cb. */
@@ -84,7 +83,7 @@ static esp_err_t dyp_trigger(void)
 }
 
 /* Fires DYP_MEASURE_MS after each trigger; runs in the FreeRTOS timer-daemon task.
- * Reads the completed measurement, signals s_result_sem, then fires the next trigger
+ * Reads the completed measurement into s_last_mm, then fires the next trigger
  * to keep the pipeline self-sustaining. */
 static void meas_timer_cb(TimerHandle_t xTimer)
 {
@@ -109,6 +108,7 @@ static void meas_timer_cb(TimerHandle_t xTimer)
     i2c_cmd_link_delete(cmd);
     xSemaphoreGive(s_bus_mutex);
 
+    xSemaphoreTake(s_val_mutex, portMAX_DELAY);
     if (err == ESP_OK) {
         uint16_t dist_mm = ((uint16_t)buf[0] << 8) | buf[1];
         s_last_mm = (dist_mm == 0 || dist_mm == 0xFFFF)
@@ -118,7 +118,7 @@ static void meas_timer_cb(TimerHandle_t xTimer)
         ESP_LOGE(TAG, "read failed: %s", esp_err_to_name(err));
         s_last_mm = DISTANCE_SENSOR_ERR;
     }
-    xSemaphoreGive(s_result_sem);
+    xSemaphoreGive(s_val_mutex);
 
     dyp_trigger();  /* pipeline: start the next measurement immediately */
 }
@@ -141,9 +141,9 @@ static void health_scan_cb(TimerHandle_t xTimer)
 
 static esp_err_t dyp_a22_init(void)
 {
-    s_bus_mutex  = xSemaphoreCreateMutex();
-    s_result_sem = xSemaphoreCreateBinary();
-    if (!s_bus_mutex || !s_result_sem) return ESP_ERR_NO_MEM;
+    s_bus_mutex = xSemaphoreCreateMutex();
+    s_val_mutex = xSemaphoreCreateMutex();
+    if (!s_bus_mutex || !s_val_mutex) return ESP_ERR_NO_MEM;
 
     i2c_config_t cfg = {
         .mode             = I2C_MODE_MASTER,
@@ -176,17 +176,15 @@ static esp_err_t dyp_a22_init(void)
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-/* Non-blocking from the caller's perspective: blocks on s_result_sem rather than
- * vTaskDelay, so the pipeline's 80 ms measurement window never stalls sensor_task.
- * On timeout (pipeline stalled) the pipeline is restarted automatically. */
+/* Returns the most recent measurement from the continuous pipeline.
+ * Always returns immediately — relies on the pipeline running faster than
+ * the application sample rate (82 ms/cycle vs SENSOR_PERIOD_MS). */
 static int32_t dyp_a22_read_mm(void)
 {
-    if (xSemaphoreTake(s_result_sem, DYP_RESULT_WAIT_TICKS) != pdTRUE) {
-        ESP_LOGW(TAG, "result timeout — restarting pipeline");
-        dyp_trigger();
-        return DISTANCE_SENSOR_ERR;
-    }
-    return s_last_mm;
+    xSemaphoreTake(s_val_mutex, portMAX_DELAY);
+    int32_t mm = s_last_mm;
+    xSemaphoreGive(s_val_mutex);
+    return mm;
 }
 
 const distance_sensor_t dyp_a22_sensor = {

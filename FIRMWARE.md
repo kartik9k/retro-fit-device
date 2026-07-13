@@ -219,29 +219,29 @@ meas_timer_cb() [timer-daemon, 80 ms after trigger]
   ├─ take s_bus_mutex
   ├─ I2C read: reg 0x02 → [H, L]    (~1 ms)
   ├─ give s_bus_mutex
-  ├─ store result in s_last_mm
-  ├─ xSemaphoreGive(s_result_sem)   ← wakes sensor_task
+  ├─ take s_val_mutex → update s_last_mm → give s_val_mutex
   └─ dyp_trigger()                  ← keeps pipeline self-sustaining
 
 health_scan_cb() [timer-daemon, every DYP_HEALTH_SCAN_MS]
   ├─ try take s_bus_mutex (skip if busy)
   ├─ i2c_scan()
-  └─ give s_bus_mutex
+  ├─ give s_bus_mutex
+  └─ telemetry_push_event("i2c_health", found)
 
 dyp_a22_read_mm() [sensor_task]
-  ├─ xSemaphoreTake(s_result_sem, 500 ms)
-  │    └─ on timeout: restarts pipeline via dyp_trigger(), returns ERR
-  └─ return s_last_mm
+  ├─ take s_val_mutex
+  ├─ copy s_last_mm
+  └─ give s_val_mutex → return copy
 ```
 
 **Key properties:**
-- `sensor_task` never calls `vTaskDelay` for the measurement window; it blocks
-  on a semaphore, so the CPU is free to run other tasks during the 80 ms.
-- The pipeline runs continuously at ~82 ms/cycle; `read_mm()` always returns
-  immediately because `s_result_sem` is already given by the time sensor_task
-  wakes from its 2-second application sleep.
+- `sensor_task` never calls `vTaskDelay` for the measurement window; it returns
+  immediately from `read_mm()` with the latest cached value.
+- The pipeline runs continuously at ~82 ms/cycle; `s_last_mm` is always fresh
+  by the time `sensor_task` wakes from its 2-second application sleep.
 - `health_scan_cb` and `meas_timer_cb` share the timer-daemon task and execute
   sequentially — no re-entrancy issues between them.
+- `sensor_task` never holds `s_bus_mutex`, only `s_val_mutex` (briefly).
 - To change the health scan interval, edit `DYP_HEALTH_SCAN_MS` in `dyp_a22.c`.
 
 #### Switching sensor configuration
@@ -296,8 +296,9 @@ Current shared variables:
 |----------|------|--------|--------|-------|
 | `s_readings[]`, `s_events[]` (in `telemetry.c`) | `telem_reading_t[]`, `telem_event_t[]` | any task via `telemetry_push_*()` | `post_task` via `telemetry_build_post()` | Yes — both protected by `s_mutex` (FreeRTOS mutex) inside `telemetry.c` |
 | `s_transport` | `const transport_driver_t *` | Set once in `app_main` before tasks start | All tasks | Yes — written before any reader exists |
-| `s_last_mm` (in `dyp_a22.c`) | `volatile int32_t` | timer-daemon (`meas_timer_cb`) | `sensor_task` (`read_mm`) | Yes — written before `xSemaphoreGive(s_result_sem)`; semaphore acts as a happens-before barrier |
-| `s_bus_mutex` (in `dyp_a22.c`) | `SemaphoreHandle_t` | — | `sensor_task`, timer-daemon | Yes — FreeRTOS mutex; all I2C callers take/release it around each transaction |
+| `s_last_mm` (in `dyp_a22.c`) | `int32_t` | timer-daemon (`meas_timer_cb`) | `sensor_task` (`read_mm`) | Yes — protected by `s_val_mutex`; `read_mm()` always returns the latest value immediately |
+| `s_bus_mutex` (in `dyp_a22.c`) | `SemaphoreHandle_t` | — | timer-daemon only (`meas_timer_cb`, `health_scan_cb`, init) | Yes — FreeRTOS mutex; all I2C callers take/release it around each transaction. `sensor_task` does not hold this mutex. |
+| `s_val_mutex` (in `dyp_a22.c`) | `SemaphoreHandle_t` | — | timer-daemon (write), `sensor_task` (read) | Yes — FreeRTOS mutex protecting `s_last_mm` |
 
 ### Telemetry module (`firmware/main/telemetry.c`)
 
