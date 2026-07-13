@@ -128,14 +128,15 @@ Defined in `firmware/main/wifi_manager.c`:
 
 | Task | Priority | Stack | Purpose |
 |------|----------|-------|---------|
-| `sensor_task` | **8** | 2 048 B | Calls `read_mm()` in a loop; triggers DYP-A22 over I2C and blocks for ~80 ms per measurement (datasheet minimum before result is valid) |
+| `sensor_task` | **8** | 2 048 B | Calls `read_mm()` every 2 s; blocks on `s_result_sem` (not `vTaskDelay`) so the 80 ms measurement window does not stall the task |
 | `post_task` | **5** | 4 096 B | Blocks on task notification; drains the reading queue and fires one batch POST |
 | `dns_server_task` | **5** | 2 048 B | UDP DNS server — active only during provisioning (captive portal); not started on normal boot |
+| FreeRTOS timer-daemon | SDK | 4 096 B | Runs `meas_timer_cb` (I2C result read + next trigger) and `health_scan_cb` (periodic I2C bus scan); stack raised in `sdkconfig.defaults` because callbacks perform I2C transactions |
 | Wi-Fi stack tasks | ~23 | SDK-managed | Managed entirely by the ESP8266 RTOS SDK |
 
 **Priority rationale:**
-- `sensor_task` at 8 ensures the HC-SR04 echo pulse busy-wait is never
-  preempted mid-measurement. Preemption mid-pulse produces a wrong distance.
+- `sensor_task` at 8 is retained from HC-SR04; safe to lower once the DYP-A22
+  pipeline is validated on the bench (I2C has no busy-wait — see sensor section below).
 - `post_task` at 5 ensures blocking HTTP (which can stall for seconds on a
   slow or unreachable server) never starves the sensor.
 - `post_timer_cb` runs in the ESP timer task — it only calls
@@ -193,6 +194,52 @@ Address `0x74`, 100 kHz. Measurement sequence:
 2. **Wait** — 80 ms minimum (datasheet); reading early returns `0xFFFF`
 3. **Read** — write register `0x02`, repeated-start, read 2 bytes `[H, L]`
 4. **Discard** — `0x0000` (blind zone / out of range) and `0xFFFF` (not ready) both map to `DISTANCE_SENSOR_ERR`
+
+#### DYP-A22 driver architecture
+
+The driver is pipeline-based and non-blocking. All I2C access is serialised by
+`s_bus_mutex`; all callers take and release it around each transaction.
+
+```
+init()
+  ├─ i2c_scan() under mutex        ← initial bus survey
+  ├─ xTimerCreate(dyp_health, 1 h) ← periodic health scan
+  └─ dyp_trigger()                 ← primes the pipeline
+
+dyp_trigger() [sensor_task or timer-daemon]
+  ├─ take s_bus_mutex
+  ├─ I2C write: reg 0x10, data 0xBD  (~1 ms)
+  ├─ give s_bus_mutex
+  └─ xTimerStart(s_meas_timer, 80 ms)
+
+meas_timer_cb() [timer-daemon, 80 ms after trigger]
+  ├─ take s_bus_mutex
+  ├─ I2C read: reg 0x02 → [H, L]    (~1 ms)
+  ├─ give s_bus_mutex
+  ├─ store result in s_last_mm
+  ├─ xSemaphoreGive(s_result_sem)   ← wakes sensor_task
+  └─ dyp_trigger()                  ← keeps pipeline self-sustaining
+
+health_scan_cb() [timer-daemon, every DYP_HEALTH_SCAN_MS]
+  ├─ try take s_bus_mutex (skip if busy)
+  ├─ i2c_scan()
+  └─ give s_bus_mutex
+
+dyp_a22_read_mm() [sensor_task]
+  ├─ xSemaphoreTake(s_result_sem, 500 ms)
+  │    └─ on timeout: restarts pipeline via dyp_trigger(), returns ERR
+  └─ return s_last_mm
+```
+
+**Key properties:**
+- `sensor_task` never calls `vTaskDelay` for the measurement window; it blocks
+  on a semaphore, so the CPU is free to run other tasks during the 80 ms.
+- The pipeline runs continuously at ~82 ms/cycle; `read_mm()` always returns
+  immediately because `s_result_sem` is already given by the time sensor_task
+  wakes from its 2-second application sleep.
+- `health_scan_cb` and `meas_timer_cb` share the timer-daemon task and execute
+  sequentially — no re-entrancy issues between them.
+- To change the health scan interval, edit `DYP_HEALTH_SCAN_MS` in `dyp_a22.c`.
 
 #### Switching sensor configuration
 

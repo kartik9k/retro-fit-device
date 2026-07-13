@@ -3,5 +3,10 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
 # Skip TLS server cert verification — development only (Mode 3 Azure HTTPS).
 # Connection is still encrypted; the server certificate is not authenticated.
-# Remove this line when cert pinning is implemented (DEFERRED §11).
+# CONFIG_ESP_TLS_INSECURE must be set first — SKIP_SERVER_CERT_VERIFY depends on it in Kconfig.
+# Remove both lines when cert pinning is implemented (DEFERRED §11).
+CONFIG_ESP_TLS_INSECURE=y
 CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+
+# Timer-daemon task stack — increased because dyp_a22 timer callbacks run I2C transactions.
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096

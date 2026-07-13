@@ -5,24 +5,38 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/timers.h"
 
 #include "distance_sensor.h"
 
-#define DYP_I2C_PORT        I2C_NUM_0
-#define DYP_I2C_SDA         GPIO_NUM_4
-#define DYP_I2C_SCL         GPIO_NUM_5
-#define DYP_I2C_ADDR        0x74
-#define DYP_REG_TRIGGER     0x10
-#define DYP_CMD_TRIGGER     0xBD
-#define DYP_REG_RESULT      0x02
-#define DYP_MEASURE_MS      80      /* datasheet minimum before result is valid */
-#define DYP_TIMEOUT_TICKS   (100 / portTICK_RATE_MS)
+#define DYP_I2C_PORT            I2C_NUM_0
+#define DYP_I2C_SDA             GPIO_NUM_4
+#define DYP_I2C_SCL             GPIO_NUM_5
+#define DYP_I2C_ADDR            0x74
+#define DYP_REG_TRIGGER         0x10
+#define DYP_CMD_TRIGGER         0xBD
+#define DYP_REG_RESULT          0x02
+#define DYP_MEASURE_MS          80          /* datasheet minimum before result is valid */
+#define DYP_TIMEOUT_TICKS       (100 / portTICK_RATE_MS)
+#define DYP_MUTEX_WAIT_TICKS    (50  / portTICK_RATE_MS)
+#define DYP_RESULT_WAIT_TICKS   (500 / portTICK_RATE_MS)   /* large enough to absorb a health scan */
+
+/* Change this value to adjust the periodic I2C bus health-check interval */
+#define DYP_HEALTH_SCAN_MS      (60UL * 60UL * 1000UL)     /* 1 hour */
 
 static const char *TAG = "dyp_a22";
 
+static SemaphoreHandle_t s_bus_mutex;    /* serialises every I2C transaction */
+static SemaphoreHandle_t s_result_sem;   /* given by the pipeline each time a result lands */
+static TimerHandle_t     s_meas_timer;   /* one-shot: fires DYP_MEASURE_MS after each trigger */
+static TimerHandle_t     s_health_timer; /* periodic: I2C bus health scan */
+static volatile int32_t  s_last_mm = DISTANCE_SENSOR_ERR;
+
+/* Caller must hold s_bus_mutex. */
 static void i2c_scan(void)
 {
-    ESP_LOGI(TAG, "I2C scan start");
+    ESP_LOGI(TAG, "I2C scan");
     bool found = false;
     for (uint8_t addr = 1; addr < 127; addr++) {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -32,35 +46,21 @@ static void i2c_scan(void)
         esp_err_t err = i2c_master_cmd_begin(DYP_I2C_PORT, cmd, DYP_TIMEOUT_TICKS);
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "  found device at 0x%02x", addr);
+            ESP_LOGI(TAG, "  found 0x%02x", addr);
             found = true;
         }
     }
     if (!found) ESP_LOGW(TAG, "  no devices found — check wiring");
-    ESP_LOGI(TAG, "I2C scan done");
 }
 
-static esp_err_t dyp_a22_init(void)
+/* Send a measurement trigger and arm s_meas_timer.
+ * Acquires and releases s_bus_mutex internally. */
+static esp_err_t dyp_trigger(void)
 {
-    i2c_config_t cfg = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = DYP_I2C_SDA,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_io_num       = DYP_I2C_SCL,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .clk_stretch_tick = 300,    /* ~210 µs stretch; suits 100 kHz default */
-    };
-    esp_err_t err = i2c_driver_install(DYP_I2C_PORT, cfg.mode);
-    if (err != ESP_OK) return err;
-    err = i2c_param_config(DYP_I2C_PORT, &cfg);
-    if (err != ESP_OK) return err;
-    i2c_scan();
-    return ESP_OK;
-}
-
-static int32_t dyp_a22_read_mm(void)
-{
-    /* Step 1: trigger a measurement — write 0xBD to register 0x10 */
+    if (xSemaphoreTake(s_bus_mutex, DYP_MUTEX_WAIT_TICKS) != pdTRUE) {
+        ESP_LOGW(TAG, "trigger: bus busy");
+        return ESP_ERR_TIMEOUT;
+    }
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (DYP_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
@@ -69,16 +69,30 @@ static int32_t dyp_a22_read_mm(void)
     i2c_master_stop(cmd);
     esp_err_t err = i2c_master_cmd_begin(DYP_I2C_PORT, cmd, DYP_TIMEOUT_TICKS);
     i2c_cmd_link_delete(cmd);
+    xSemaphoreGive(s_bus_mutex);
+
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "trigger failed: %s", esp_err_to_name(err));
-        return DISTANCE_SENSOR_ERR;
+        return err;
+    }
+    xTimerStart(s_meas_timer, 0);
+    return ESP_OK;
+}
+
+/* Fires DYP_MEASURE_MS after each trigger; runs in the FreeRTOS timer-daemon task.
+ * Reads the completed measurement, signals s_result_sem, then fires the next trigger
+ * to keep the pipeline self-sustaining. */
+static void meas_timer_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+
+    if (xSemaphoreTake(s_bus_mutex, DYP_MUTEX_WAIT_TICKS) != pdTRUE) {
+        ESP_LOGW(TAG, "read: bus busy");
+        dyp_trigger();
+        return;
     }
 
-    /* Step 2: wait for measurement to complete */
-    vTaskDelay(pdMS_TO_TICKS(DYP_MEASURE_MS));
-
-    /* Step 3: select result register 0x02, then read H and L bytes */
-    cmd = i2c_cmd_link_create();
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (DYP_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
     i2c_master_write_byte(cmd, DYP_REG_RESULT, true);
@@ -87,16 +101,84 @@ static int32_t dyp_a22_read_mm(void)
     uint8_t buf[2] = {0};
     i2c_master_read(cmd, buf, sizeof(buf), I2C_MASTER_LAST_NACK);
     i2c_master_stop(cmd);
-    err = i2c_master_cmd_begin(DYP_I2C_PORT, cmd, DYP_TIMEOUT_TICKS);
+    esp_err_t err = i2c_master_cmd_begin(DYP_I2C_PORT, cmd, DYP_TIMEOUT_TICKS);
     i2c_cmd_link_delete(cmd);
-    if (err != ESP_OK) {
+    xSemaphoreGive(s_bus_mutex);
+
+    if (err == ESP_OK) {
+        uint16_t dist_mm = ((uint16_t)buf[0] << 8) | buf[1];
+        s_last_mm = (dist_mm == 0 || dist_mm == 0xFFFF)
+                    ? DISTANCE_SENSOR_ERR
+                    : (int32_t)dist_mm;
+    } else {
         ESP_LOGE(TAG, "read failed: %s", esp_err_to_name(err));
+        s_last_mm = DISTANCE_SENSOR_ERR;
+    }
+    xSemaphoreGive(s_result_sem);
+
+    dyp_trigger();  /* pipeline: start the next measurement immediately */
+}
+
+/* Periodic health check — skips gracefully if the bus is in use. */
+static void health_scan_cb(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+    if (xSemaphoreTake(s_bus_mutex, DYP_MUTEX_WAIT_TICKS) != pdTRUE) {
+        ESP_LOGW(TAG, "health scan: bus busy, skipping");
+        return;
+    }
+    i2c_scan();
+    xSemaphoreGive(s_bus_mutex);
+}
+
+static esp_err_t dyp_a22_init(void)
+{
+    s_bus_mutex  = xSemaphoreCreateMutex();
+    s_result_sem = xSemaphoreCreateBinary();
+    if (!s_bus_mutex || !s_result_sem) return ESP_ERR_NO_MEM;
+
+    i2c_config_t cfg = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = DYP_I2C_SDA,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_io_num       = DYP_I2C_SCL,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .clk_stretch_tick = 300,
+    };
+    esp_err_t err = i2c_driver_install(DYP_I2C_PORT, cfg.mode);
+    if (err != ESP_OK) return err;
+    err = i2c_param_config(DYP_I2C_PORT, &cfg);
+    if (err != ESP_OK) return err;
+
+    xSemaphoreTake(s_bus_mutex, portMAX_DELAY);
+    i2c_scan();
+    xSemaphoreGive(s_bus_mutex);
+
+    s_meas_timer = xTimerCreate("dyp_meas",
+                                pdMS_TO_TICKS(DYP_MEASURE_MS),
+                                pdFALSE, NULL, meas_timer_cb);
+    s_health_timer = xTimerCreate("dyp_health",
+                                  pdMS_TO_TICKS(DYP_HEALTH_SCAN_MS),
+                                  pdTRUE, NULL, health_scan_cb);
+    if (!s_meas_timer || !s_health_timer) return ESP_ERR_NO_MEM;
+
+    xTimerStart(s_health_timer, 0);
+
+    err = dyp_trigger();    /* prime the pipeline */
+    return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+/* Non-blocking from the caller's perspective: blocks on s_result_sem rather than
+ * vTaskDelay, so the pipeline's 80 ms measurement window never stalls sensor_task.
+ * On timeout (pipeline stalled) the pipeline is restarted automatically. */
+static int32_t dyp_a22_read_mm(void)
+{
+    if (xSemaphoreTake(s_result_sem, DYP_RESULT_WAIT_TICKS) != pdTRUE) {
+        ESP_LOGW(TAG, "result timeout — restarting pipeline");
+        dyp_trigger();
         return DISTANCE_SENSOR_ERR;
     }
-
-    uint16_t dist_mm = ((uint16_t)buf[0] << 8) | buf[1];
-    if (dist_mm == 0 || dist_mm == 0xFFFF) return DISTANCE_SENSOR_ERR;
-    return (int32_t)dist_mm;
+    return s_last_mm;
 }
 
 const distance_sensor_t dyp_a22_sensor = {
