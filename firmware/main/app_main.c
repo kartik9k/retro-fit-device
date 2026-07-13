@@ -13,8 +13,13 @@
 #include "transport.h"
 
 /* ---- active sensor: swap this include + pointer to change hardware ---- */
-#include "hcsr04.h"
-static const distance_sensor_t *s_sensor = &hcsr04_sensor;
+// v1 — HC-SR04 (deactivated — hardware removed):
+// #include "hcsr04.h"
+// static const distance_sensor_t *s_sensor = &hcsr04_sensor;
+
+// v2 — DYP-A22 (active):
+#include "dyp_a22.h"
+static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
 /* ----------------------------------------------------------------------- */
 
 /* ---------- user config ----------
@@ -167,8 +172,8 @@ void app_main(void)
     s_transport = transport_get();
 
     ESP_ERROR_CHECK(s_sensor->init());
-    /* Priority 8: above httpd/dns (5) so the echo pulse busy-wait is not
-     * preempted mid-measurement; well below WiFi stack tasks (~23). */
+    /* Priority 8: retained from HC-SR04; safe to lower once DYP-A22 driver
+     * is validated (I2C has no busy-wait — see FIRMWARE.md). */
     xTaskCreate(sensor_task, "sensor", 2048, NULL, 8, NULL);
     /* Priority 5: HTTP can block for seconds without affecting the sensor. */
     xTaskCreate(post_task, "post", 4096, NULL, 5, &s_post_task_handle);

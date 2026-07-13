@@ -50,9 +50,10 @@ make monitor
 ```
 
 Build artefacts land in `firmware/build/`. `firmware/sdkconfig` holds the
-active configuration; `firmware/sdkconfig.defaults` seeds it on first run
-(currently only raises `CONFIG_HTTPD_MAX_REQ_HDR_LEN` to 1024 to accommodate
-iOS captive-portal headers).
+active configuration; `firmware/sdkconfig.defaults` seeds it on first run with:
+- `CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024` — accommodates iOS captive-portal headers
+- `CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=4096` — timer-daemon stack raised because `dyp_a22` timer callbacks perform I2C transactions
+- `CONFIG_ESP_TLS_INSECURE` / `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` — dev-only TLS; remove when cert pinning is implemented (DEFERRED §11)
 
 ### Key configuration constants (`main/app_main.c`)
 
@@ -62,7 +63,7 @@ These must be reviewed before flashing to a new deployment:
 |----------|---------|-------------|
 | `POST_URL` | Two options in `firmware/main/app_main.c` — uncomment the correct line | **Mode 1 (LAN):** `http://192.168.1.65:5000/api/data` — find LAN IP with `ip route get 1 \| awk '{print $7; exit}'`. **Mode 3 (Azure):** `https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data`. TLS cert (ISRG Root X1) is embedded in `wifi_transport.c` — no extra config needed. |
 | `POST_PERIOD_US` | 30 000 000 µs (30 s) | How often the batch POST fires |
-| `SENSOR_PERIOD_MS` | 2 000 ms | HC-SR04 sampling interval |
+| `SENSOR_PERIOD_MS` | 2 000 ms | Sensor sampling interval (application sleep between `read_mm()` calls) |
 | `READING_QUEUE_DEPTH` | 30 | Max readings buffered between POSTs (~60 s at 2 s/sample) |
 
 ---
@@ -284,7 +285,8 @@ between drivers:
 
 The ESP8266 is single-core. 32-bit aligned reads and writes are atomic — no
 mutex is needed for `int32_t` or `uint32_t` shared between tasks, provided
-only one task writes and the other only reads.
+only one task writes and the other only reads. Where multiple tasks perform
+I2C transactions (as in the DYP-A22 driver), a FreeRTOS mutex serialises bus access.
 
 Current shared variables:
 
@@ -292,6 +294,8 @@ Current shared variables:
 |----------|------|--------|--------|-------|
 | `s_reading_queue` | `QueueHandle_t` | `sensor_task` (send) | `post_task` (receive) | Yes — FreeRTOS queue is thread-safe |
 | `s_transport` | `const transport_driver_t *` | Set once in `app_main` before tasks start | All tasks | Yes — written before any reader exists |
+| `s_last_mm` (in `dyp_a22.c`) | `volatile int32_t` | timer-daemon (`meas_timer_cb`) | `sensor_task` (`read_mm`) | Yes — written before `xSemaphoreGive(s_result_sem)`; semaphore acts as a happens-before barrier |
+| `s_bus_mutex` (in `dyp_a22.c`) | `SemaphoreHandle_t` | — | `sensor_task`, timer-daemon | Yes — FreeRTOS mutex; all I2C callers take/release it around each transaction |
 
 ### Batch POST format
 

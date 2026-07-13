@@ -57,10 +57,10 @@ A 2S 18650 Li-ion pack (~14 Ah usable) covers 6 months at a 15-minute interval.
 **What must be true before implementing:**
 - PM must confirm minimum acceptable POST interval for cellular deployments —
   this determines battery pack size and the sleep/wake cycle duration.
-- The sensor task busy-wait loop (`read_mm()` on HC-SR04) is incompatible with
-  deep sleep wake cycles under ~100 ms. For infrequent reporting the sensor
-  fires once per wake, not continuously — the task architecture changes
-  fundamentally.
+- The DYP-A22 driver uses a self-sustaining FreeRTOS timer pipeline that fires
+  continuously at ~82 ms/cycle. Under deep sleep the pipeline must be replaced
+  with a single-shot trigger-wait-read sequence per wake — the task architecture
+  changes fundamentally.
 - Hardware Agent must confirm that the SIM7080G PSM wake latency (time from
   deep sleep exit to first successful POST) fits within the desired window.
 

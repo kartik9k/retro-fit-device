@@ -43,7 +43,7 @@
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `device` | `string` | Yes | Non-empty device identifier. Fixed value `"retro-fit"` in current firmware. |
-| `sensor` | `string` | Yes | Short sensor-type tag. Current values: `"us"` (HC-SR04 ultrasonic). New sensor modules add a new tag here — no other field changes required. Defined in firmware as `SENSOR_TYPE_TAG` in `distance_sensor.h`. |
+| `sensor` | `string` | Yes | Short sensor-type tag. Current values: `"us"` (DYP-A22 ultrasonic). New sensor modules add a new tag here — no other field changes required. Defined in firmware as `SENSOR_TYPE_TAG` in `distance_sensor.h`. |
 | `readings` | `array` | Yes | Ordered list of samples, oldest first. May be empty (server returns 0 inserts). |
 | `readings[].v` | `number \| null` | Yes | Sensor value in the unit implied by `sensor` (cm for `"us"`). `null` when sensor returned out-of-range or timeout. |
 | `readings[].t` | `integer` | Yes | Milliseconds since device boot (`esp_timer_get_time() / 1000`). Monotonically increasing within a batch. Wraps at ~49.7 days. |

@@ -30,7 +30,7 @@ configuration).
 
 | | **v1 — HC-SR04** | **v2 — DYP-A22** |
 |---|---|---|
-| Status | **Active — in use** | Ordered — hardware not yet received |
+| Status | Inactive — removed from board | **Active — in use** |
 | Sensor | HC-SR04 (non-waterproof) | DYP-A22 (IP67 waterproof) |
 | Min range | 2 cm | 2 cm |
 | Max range | 400 cm | 300 cm |
@@ -40,11 +40,10 @@ configuration).
 | Voltage divider on GPIO4 | Required (1 kΩ / 2 kΩ) | **Must be removed** |
 | I2C pull-ups | Not applicable | 4.7 kΩ × 2 to 3.3 V required |
 | Supply | 5 V (Vin) | 3.3 V |
-| Driver file | `firmware/main/hcsr04.c` | `firmware/main/dyp_a22.c` *(stub)* |
+| Driver file | `firmware/main/hcsr04.c` | `firmware/main/dyp_a22.c` |
 
-> **v2 note:** DYP-A22 driver is a stub returning `DISTANCE_SENSOR_ERR`.
-> Full I2C implementation is pending hardware receipt and bench testing.
-> See `firmware/main/dyp_a22.c` TODO block for the implementation checklist.
+> **v2 note:** DYP-A22 is the active sensor. I2C driver implemented in `firmware/main/dyp_a22.c`.
+> HC-SR04 voltage divider must be removed and I2C pull-ups fitted before use (see board changes below).
 
 ---
 
@@ -90,9 +89,8 @@ Divider ratio: 2/3 → 5 V × 0.667 = 3.33 V at GPIO4. Within ESP8266 absolute m
 
 ## v2 — DYP-A22 Waterproof Ultrasonic Sensor (I2C mode)
 
-> **Status: ordered, hardware not yet received. Board changes below apply
-> when fitting the DYP-A22. Do not make these board changes until the unit
-> has been verified on the bench.**
+> **Status: active. Apply the board changes below before fitting the DYP-A22
+> if migrating from HC-SR04.**
 
 ### Board changes required when migrating from v1
 
@@ -115,8 +113,8 @@ Divider ratio: 2/3 → 5 V × 0.667 = 3.33 V at GPIO4. Within ESP8266 absolute m
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Default I2C address | TBC | Confirm from datasheet on received unit |
-| Bus speed | 400 kHz | Standard fast-mode |
+| Default I2C address | 0x74 | 7-bit address; confirmed on received unit |
+| Bus speed | 100 kHz | ESP8266 RTOS SDK I2C default |
 | Pull-up value | 4.7 kΩ | To 3.3 V; required — ESP8266 internal pull-ups insufficient for reliable I2C |
 
 ### Specifications
@@ -128,7 +126,7 @@ Divider ratio: 2/3 → 5 V × 0.667 = 3.33 V at GPIO4. Within ESP8266 absolute m
 | Active current | ~8–15 mA (confirm on received unit) |
 | IP rating | IP67 |
 | Supply voltage | 3.3 V |
-| Response time | ~30 ms |
+| Response time | 80 ms minimum (datasheet) |
 
 ### I2C bus extensibility
 
@@ -201,7 +199,7 @@ the board. The UART TX swap is done in software after boot, so this is safe.
 
 The active sensor configuration determines GPIO4 and GPIO5 function.
 
-### v1 — HC-SR04 (active)
+### v1 — HC-SR04 (inactive)
 
 | GPIO | Direction | Function | Notes |
 |------|-----------|----------|-------|
@@ -212,7 +210,7 @@ The active sensor configuration determines GPIO4 and GPIO5 function.
 | GPIO14 | Output | SIM7080G nRESET *(optional)* | Active-low |
 | GPIO15 | Output | SIM7080G RX ← ESP TX | UART0 TX after pin-swap; **10 kΩ pull-down to GND required** |
 
-### v2 — DYP-A22 (pending)
+### v2 — DYP-A22 (active)
 
 | GPIO | Direction | Function | Notes |
 |------|-----------|----------|-------|
@@ -235,3 +233,4 @@ The active sensor configuration determines GPIO4 and GPIO5 function.
 | 2026-04-20 | Initial hardware config documented | Hardware Agent | Firmware Agent |
 | 2026-04-20 | Added SIM7080G wiring, power supply, UART0 pin-swap, updated GPIO table | Hardware Agent | Firmware Agent |
 | 2026-04-20 | Added v2 DYP-A22 configuration alongside v1 HC-SR04; dual GPIO tables | Hardware Agent | Firmware Agent |
+| 2026-07-13 | DYP-A22 received; v2 promoted to active, v1 deactivated; I2C address confirmed 0x74, bus speed 100 kHz, response time 80 ms minimum | Hardware Agent | Firmware Agent |
