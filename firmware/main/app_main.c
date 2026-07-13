@@ -32,6 +32,7 @@ static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
 // #define POST_URL  "http://192.168.1.65:5000/api/data"           /* Mode 1 — LAN  */
 #define POST_URL     "https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data"  /* Mode 3 — Azure */
 
+#define PROTO_VERSION       1                        /* increment on breaking wire-format changes */
 #define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
 #define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
 #define READING_QUEUE_DEPTH 30                       /* ~60 s at 2 s/sample */
@@ -84,8 +85,8 @@ static void sensor_task(void *arg)
 
 /*
  * Per-reading budget: {"v":650.0,"t":4294967295}, = 27 chars worst-case.
- * Envelope: {"device":"retro-fit","sensor":"us","readings":[]} = 50 chars.
- * 30 × 27 + 50 = 860 → 900 gives comfortable headroom.
+ * Envelope: {"proto":1,"device":"retro-fit","sensor":"us","readings":[]} = 62 chars.
+ * 30 × 27 + 62 = 872 → 900 gives comfortable headroom.
  */
 #define BATCH_BUF_SZ  900
 
@@ -94,8 +95,8 @@ static void http_post_batch(const reading_t *batch, int count)
     static char body[BATCH_BUF_SZ];
 
     int pos = snprintf(body, sizeof(body),
-                       "{\"device\":\"retro-fit\",\"sensor\":\"%s\",\"readings\":[",
-                       SENSOR_TYPE_TAG);
+                       "{\"proto\":%d,\"device\":\"retro-fit\",\"sensor\":\"%s\",\"readings\":[",
+                       PROTO_VERSION, SENSOR_TYPE_TAG);
     for (int i = 0; i < count; i++) {
         const reading_t *r = &batch[i];
         /* Reserve 4 bytes for closing "]}" and null terminator */

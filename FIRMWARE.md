@@ -62,6 +62,7 @@ These must be reviewed before flashing to a new deployment:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `POST_URL` | Two options in `firmware/main/app_main.c` — uncomment the correct line | **Mode 1 (LAN):** `http://192.168.1.65:5000/api/data` — find LAN IP with `ip route get 1 \| awk '{print $7; exit}'`. **Mode 3 (Azure):** `https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data`. TLS cert (ISRG Root X1) is embedded in `wifi_transport.c` — no extra config needed. |
+| `PROTO_VERSION` | `1` | Wire protocol major version — increment on any breaking change to the POST body shape; see `API_CONTRACT.md` |
 | `POST_PERIOD_US` | 30 000 000 µs (30 s) | How often the batch POST fires |
 | `SENSOR_PERIOD_MS` | 2 000 ms | Sensor sampling interval (application sleep between `read_mm()` calls) |
 | `READING_QUEUE_DEPTH` | 30 | Max readings buffered between POSTs (~60 s at 2 s/sample) |

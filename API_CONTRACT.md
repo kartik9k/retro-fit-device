@@ -28,6 +28,7 @@
 
 ```json
 {
+  "proto": 1,
   "device": "retro-fit",
   "sensor": "us",
   "readings": [
@@ -47,6 +48,7 @@
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
+| `proto` | `integer` | Yes | Protocol major version. Current value: `1`. Server rejects with `400` if the value exceeds the highest version it supports. Absent in pre-versioning firmware — server must treat absence as `1`. Defined in firmware as `PROTO_VERSION` in `app_main.c`. |
 | `device` | `string` | Yes | Non-empty device identifier. Fixed value `"retro-fit"` in current firmware. |
 | `sensor` | `string` | Yes | Short sensor-type tag. Current values: `"us"` (DYP-A22 ultrasonic). New sensor modules add a new tag here — no other field changes required. Defined in firmware as `SENSOR_TYPE_TAG` in `distance_sensor.h`. |
 | `readings` | `array` | Yes | Ordered list of samples, oldest first. May be empty (server returns 0 inserts). |
@@ -135,3 +137,4 @@ The SSE payload is a single JSON object matching `ReadingOut`. This is not negot
 | 2026-04-20 | Payload optimisation: `distance_cm`→`v`, `timestamp_ms`→`t`, add `sensor` field; `BATCH_BUF_SZ` 1600→900; DB columns `distance_cm`→`value`, add `sensor_type` | Server Agent | Firmware Agent |
 | 2026-04-21 | Add Mode 3 Azure HTTPS base URL; TLS via ISRG Root X1 CA cert embedded in firmware; Mode 1 LAN HTTP unchanged | Firmware Agent | Server Agent |
 | 2026-07-13 | Add optional `events` array for device telemetry; define event key registry (`i2c_health`, `rssi`, `heap_free`, `reboot_reason`, `post_failures`); send frequency is firmware implementation detail and not part of contract | Firmware Agent | Server Agent |
+| 2026-07-13 | Add `proto` integer field (major protocol version); current value `1`; server treats absence as `1` for backward compat; rejects unsupported versions with `400` | Firmware Agent | Server Agent |
