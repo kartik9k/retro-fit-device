@@ -9,9 +9,9 @@
 
 ## Project overview
 
-ESP8266 firmware that reads distance from an HC-SR04 ultrasonic sensor and
-POSTs batched readings over Wi-Fi (or, in future, cellular) to a companion
-FastAPI server. The ESP8266 RTOS SDK lives in `firmware/esp8266-rtos-sdk/` as a
+ESP8266 firmware that reads distance from a DYP-A22 waterproof ultrasonic
+sensor (I2C) and POSTs batched readings over Wi-Fi (or, in future, cellular)
+to a companion FastAPI server. The ESP8266 RTOS SDK lives in `firmware/esp8266-rtos-sdk/` as a
 submodule — no external SDK installation is required.
 
 ---
@@ -128,7 +128,7 @@ Defined in `firmware/main/wifi_manager.c`:
 
 | Task | Priority | Stack | Purpose |
 |------|----------|-------|---------|
-| `sensor_task` | **8** | 2 048 B | Calls `read_mm()` in a loop; busy-waits on GPIO for the HC-SR04 echo pulse |
+| `sensor_task` | **8** | 2 048 B | Calls `read_mm()` in a loop; triggers DYP-A22 over I2C and blocks for ~80 ms per measurement (datasheet minimum before result is valid) |
 | `post_task` | **5** | 4 096 B | Blocks on task notification; drains the reading queue and fires one batch POST |
 | `dns_server_task` | **5** | 2 048 B | UDP DNS server — active only during provisioning (captive portal); not started on normal boot |
 | Wi-Fi stack tasks | ~23 | SDK-managed | Managed entirely by the ESP8266 RTOS SDK |
@@ -181,10 +181,18 @@ configurations for the full wiring and board-change details.
 
 | | **v1 — HC-SR04** | **v2 — DYP-A22** |
 |---|---|---|
-| Status | **Active** | Stub — hardware ordered, not received |
+| Status | Inactive — removed from board | **Active** |
 | Driver | `firmware/main/hcsr04.c` | `firmware/main/dyp_a22.c` |
 | Interface | TRIG/ECHO pulse on GPIO5/GPIO4 | I2C on GPIO4 (SDA) / GPIO5 (SCL) |
-| Testable | Yes | Only when hardware arrives |
+
+#### DYP-A22 I2C protocol
+
+Address `0x74`, 100 kHz. Measurement sequence:
+
+1. **Trigger** — write register `0x10`, data `0xBD`
+2. **Wait** — 80 ms minimum (datasheet); reading early returns `0xFFFF`
+3. **Read** — write register `0x02`, repeated-start, read 2 bytes `[H, L]`
+4. **Discard** — `0x0000` (blind zone / out of range) and `0xFFFF` (not ready) both map to `DISTANCE_SENSOR_ERR`
 
 #### Switching sensor configuration
 
@@ -192,13 +200,13 @@ Edit the two marked lines in `firmware/main/app_main.c`:
 
 ```c
 /* ---- active sensor: swap this include + pointer to change hardware ---- */
-// v1 — HC-SR04:
-#include "hcsr04.h"
-static const distance_sensor_t *s_sensor = &hcsr04_sensor;
+// v1 — HC-SR04 (inactive):
+// #include "hcsr04.h"
+// static const distance_sensor_t *s_sensor = &hcsr04_sensor;
 
-// v2 — DYP-A22 (hardware pending):
-// #include "dyp_a22.h"
-// static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
+// v2 — DYP-A22 (active):
+#include "dyp_a22.h"
+static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
 /* ----------------------------------------------------------------------- */
 ```
 
@@ -206,8 +214,8 @@ No other files need to change. The `sensor_task` priority rationale differs
 between drivers:
 - **v1 (HC-SR04):** `sensor_task` at priority 8 is critical — the TRIG/ECHO
   busy-wait must not be preempted mid-pulse.
-- **v2 (DYP-A22):** I2C is interrupt/DMA-driven; the busy-wait is gone. Priority
-  8 can be reduced once the driver is validated. Flag to Hardware Agent before
+- **v2 (DYP-A22, active):** I2C has no busy-wait; priority 8 is safe to lower
+  once the driver is validated on the bench. Notify Hardware Agent before
   changing priority.
 
 ### Wi-Fi provisioning flow (`firmware/main/wifi_manager.c`)
