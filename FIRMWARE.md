@@ -62,10 +62,10 @@ These must be reviewed before flashing to a new deployment:
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `POST_URL` | Two options in `firmware/main/app_main.c` — uncomment the correct line | **Mode 1 (LAN):** `http://192.168.1.65:5000/api/data` — find LAN IP with `ip route get 1 \| awk '{print $7; exit}'`. **Mode 3 (Azure):** `https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data`. TLS cert (ISRG Root X1) is embedded in `wifi_transport.c` — no extra config needed. |
-| `PROTO_VERSION` | `"1.0"` | Wire protocol version string (`"major.minor"`) — bump minor on additive changes, major on breaking ones; see `API_CONTRACT.md` |
+| `PROTO_VERSION` | `"1.0"` | Wire protocol version string (`"major.minor"`) — defined in `telemetry.h`; bump minor on additive changes, major on breaking ones; see `API_CONTRACT.md` |
 | `POST_PERIOD_US` | 30 000 000 µs (30 s) | How often the batch POST fires |
 | `SENSOR_PERIOD_MS` | 2 000 ms | Sensor sampling interval (application sleep between `read_mm()` calls) |
-| `READING_QUEUE_DEPTH` | 30 | Max readings buffered between POSTs (~60 s at 2 s/sample) |
+| `READING_FLUSH_AT` | 25 | Telemetry flush threshold — `post_task` is notified immediately when this many readings accumulate (defined in `telemetry.h`) |
 
 ---
 
@@ -294,16 +294,28 @@ Current shared variables:
 
 | Variable | Type | Writer | Reader | Safe? |
 |----------|------|--------|--------|-------|
-| `s_reading_queue` | `QueueHandle_t` | `sensor_task` (send) | `post_task` (receive) | Yes — FreeRTOS queue is thread-safe |
+| `s_readings[]`, `s_events[]` (in `telemetry.c`) | `telem_reading_t[]`, `telem_event_t[]` | any task via `telemetry_push_*()` | `post_task` via `telemetry_build_post()` | Yes — both protected by `s_mutex` (FreeRTOS mutex) inside `telemetry.c` |
 | `s_transport` | `const transport_driver_t *` | Set once in `app_main` before tasks start | All tasks | Yes — written before any reader exists |
 | `s_last_mm` (in `dyp_a22.c`) | `volatile int32_t` | timer-daemon (`meas_timer_cb`) | `sensor_task` (`read_mm`) | Yes — written before `xSemaphoreGive(s_result_sem)`; semaphore acts as a happens-before barrier |
 | `s_bus_mutex` (in `dyp_a22.c`) | `SemaphoreHandle_t` | — | `sensor_task`, timer-daemon | Yes — FreeRTOS mutex; all I2C callers take/release it around each transaction |
 
-### Batch POST format
+### Telemetry module (`firmware/main/telemetry.c`)
 
-JSON body built in `http_post_batch()` (`main/app_main.c`). Buffer size
-`BATCH_BUF_SZ = 900` bytes (worst-case: 30 readings × 27 chars + 50-char
-envelope = ~860 bytes). A truncation warning is logged if the buffer fills.
+All outbound data is managed by the `telemetry` module. Any subsystem
+(sensor driver, I2C driver, Wi-Fi stack) calls `telemetry_push_reading()` or
+`telemetry_push_event()` without knowing about HTTP or FreeRTOS queues.
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `READING_QUEUE_DEPTH` | 30 | Max readings buffered between POSTs |
+| `EVENT_QUEUE_DEPTH` | 16 | Max events buffered between POSTs |
+| `READING_FLUSH_AT` | 25 | Notify `post_task` immediately when this many readings accumulate |
+| `EVENT_FLUSH_AT` | 8 | Notify `post_task` immediately when this many events accumulate |
+| `TELEM_BUF_SZ` | 2300 | JSON body buffer (bytes); sized for worst-case full buffers |
+
+`telemetry_build_post()` snapshots both arrays under mutex, clears the counts,
+builds the full JSON body outside the lock, and returns the total item count.
+A return value of 0 means nothing to send — `post_task` skips the POST.
 
 Wire format is defined in `API_CONTRACT.md` — do not change it here without
 following the Firmware ↔ Server notification rule.

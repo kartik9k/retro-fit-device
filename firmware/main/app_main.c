@@ -1,16 +1,15 @@
-#include <string.h>
-#include <stdio.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
 
 #include "transport.h"
+#include "telemetry.h"
 
 /* ---- active sensor: swap this include + pointer to change hardware ---- */
 // v1 — HC-SR04 (deactivated — hardware removed):
@@ -26,30 +25,18 @@ static const distance_sensor_t *s_sensor = &dyp_a22_sensor;
  * POST_URL: uncomment the line that matches your deployment mode.
  *   Mode 1 — LAN  : device and server on the same Wi-Fi network.
  *   Mode 3 — Azure: device posts over the internet to the cloud server.
- *                   Requires the TLS CA cert in wifi_transport.c to match
- *                   the server's certificate chain (Let's Encrypt / ISRG Root X1).
  */
 // #define POST_URL  "http://192.168.1.65:5000/api/data"           /* Mode 1 — LAN  */
 #define POST_URL     "https://retro-fit-server.nicepebble-7757b674.uksouth.azurecontainerapps.io/api/data"  /* Mode 3 — Azure */
 
-#define PROTO_VERSION       "1.0"                    /* major.minor — increment minor on additive changes, major on breaking ones */
-#define POST_PERIOD_US      (30ULL * 1000 * 1000)   /* 30 s */
-#define SENSOR_PERIOD_MS    2000                     /* sample every 2 s */
-#define READING_QUEUE_DEPTH 30                       /* ~60 s at 2 s/sample */
+#define POST_PERIOD_US   (30ULL * 1000 * 1000)  /* 30 s — periodic flush regardless of threshold */
+#define SENSOR_PERIOD_MS 2000                    /* application sample interval                   */
 /* --------------------------------- */
 
 static const char *TAG = "retro-fit";
-static esp_timer_handle_t         s_post_timer;
-static QueueHandle_t              s_reading_queue;
-static TaskHandle_t               s_post_task_handle;
-static const transport_driver_t  *s_transport;
-
-/* Each queued reading carries a device-boot-relative timestamp so the server
- * can reconstruct wall-clock time for every sample in a batch. */
-typedef struct {
-    int32_t  distance_mm;
-    uint32_t timestamp_ms;   /* ms since device boot; wraps ~49 days */
-} reading_t;
+static esp_timer_handle_t        s_post_timer;
+static TaskHandle_t              s_post_task_handle;
+static const transport_driver_t *s_transport;
 
 /* ------------------------------------------------------------------ */
 /*  Sensor task — runs continuously regardless of network state        */
@@ -58,71 +45,20 @@ typedef struct {
 static void sensor_task(void *arg)
 {
     for (;;) {
-        reading_t r = {
-            .distance_mm  = s_sensor->read_mm(),
-            .timestamp_ms = (uint32_t)(esp_timer_get_time() / 1000),
-        };
-        if (r.distance_mm == DISTANCE_SENSOR_ERR) {
+        int32_t  mm = s_sensor->read_mm();
+        uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (mm == DISTANCE_SENSOR_ERR) {
             ESP_LOGW(TAG, "sensor: no reading / out of range");
         } else {
-            ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm",
-                     r.distance_mm / 10, r.distance_mm % 10);
+            ESP_LOGI(TAG, "Distance: %"PRId32".%"PRId32" cm", mm / 10, mm % 10);
         }
-        /* When the queue is full, evict the oldest reading so the newest
-         * data is always preserved. */
-        if (xQueueSend(s_reading_queue, &r, 0) != pdTRUE) {
-            reading_t discard;
-            xQueueReceive(s_reading_queue, &discard, 0);
-            xQueueSend(s_reading_queue, &r, 0);
-        }
+
+        telemetry_push_reading(SENSOR_TYPE_TAG,
+                               mm == DISTANCE_SENSOR_ERR ? TELEM_READING_ERR : mm,
+                               ts);
+
         vTaskDelay(pdMS_TO_TICKS(SENSOR_PERIOD_MS));
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/*  HTTP batch POST                                                     */
-/* ------------------------------------------------------------------ */
-
-/*
- * Per-reading worst case: {"k":"us","v":650.0,"t":4294967295}, = 36 chars.
- * Envelope: {"proto":"1.0","device":"retro-fit","readings":[]} = 50 chars.
- * 30 × 36 + 50 = 1130 → 1300 gives headroom for future events array.
- */
-#define BATCH_BUF_SZ  1300
-
-static void http_post_batch(const reading_t *batch, int count)
-{
-    static char body[BATCH_BUF_SZ];
-
-    int pos = snprintf(body, sizeof(body),
-                       "{\"proto\":\"%s\",\"device\":\"retro-fit\",\"readings\":[",
-                       PROTO_VERSION);
-    for (int i = 0; i < count; i++) {
-        const reading_t *r = &batch[i];
-        /* Reserve 4 bytes for closing "]}" and null terminator */
-        int room = (int)sizeof(body) - pos - 4;
-        if (room <= 0) {
-            ESP_LOGW(TAG, "batch truncated at %d/%d readings", i, count);
-            break;
-        }
-        if (r->distance_mm == DISTANCE_SENSOR_ERR) {
-            pos += snprintf(body + pos, room,
-                            "{\"k\":\"%s\",\"v\":null,\"t\":%"PRIu32"}",
-                            SENSOR_TYPE_TAG, r->timestamp_ms);
-        } else {
-            pos += snprintf(body + pos, room,
-                            "{\"k\":\"%s\",\"v\":%"PRId32".%"PRId32",\"t\":%"PRIu32"}",
-                            SENSOR_TYPE_TAG,
-                            r->distance_mm / 10, r->distance_mm % 10,
-                            r->timestamp_ms);
-        }
-        if (i < count - 1) body[pos++] = ',';
-    }
-    snprintf(body + pos, sizeof(body) - pos, "]}");
-
-    esp_err_t err = s_transport->post(POST_URL, body, strlen(body));
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "batch of %d readings flushed", count);
     }
 }
 
@@ -140,22 +76,21 @@ static void post_timer_cb(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
-/*  POST task — drains the reading queue and fires one batch POST      */
+/*  POST task — builds and sends one batch on each notification        */
 /* ------------------------------------------------------------------ */
 
 static void post_task(void *arg)
 {
-    static reading_t batch[READING_QUEUE_DEPTH];
+    static char body[TELEM_BUF_SZ];
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        int count = 0;
-        while (count < READING_QUEUE_DEPTH &&
-               xQueueReceive(s_reading_queue, &batch[count], 0) == pdTRUE) {
-            count++;
-        }
-        if (count > 0) {
-            http_post_batch(batch, count);
+        int items = telemetry_build_post(body, sizeof(body));
+        if (items == 0) continue;  /* threshold fired but nothing accumulated */
+
+        esp_err_t err = s_transport->post(POST_URL, body, strlen(body));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "flushed %d items", items);
         }
     }
 }
@@ -168,17 +103,16 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "retro-fit-device starting");
 
-    s_reading_queue = xQueueCreate(READING_QUEUE_DEPTH, sizeof(reading_t));
-    configASSERT(s_reading_queue);
-
     s_transport = transport_get();
+
+    /* post_task must exist before telemetry_init so the handle is valid */
+    xTaskCreate(post_task, "post", 4096, NULL, 5, &s_post_task_handle);
+    ESP_ERROR_CHECK(telemetry_init(s_post_task_handle, "retro-fit"));
 
     ESP_ERROR_CHECK(s_sensor->init());
     /* Priority 8: retained from HC-SR04; safe to lower once DYP-A22 driver
      * is validated (I2C has no busy-wait — see FIRMWARE.md). */
     xTaskCreate(sensor_task, "sensor", 2048, NULL, 8, NULL);
-    /* Priority 5: HTTP can block for seconds without affecting the sensor. */
-    xTaskCreate(post_task, "post", 4096, NULL, 5, &s_post_task_handle);
 
     ESP_ERROR_CHECK(s_transport->init());
 

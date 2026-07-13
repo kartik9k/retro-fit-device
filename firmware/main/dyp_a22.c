@@ -3,12 +3,14 @@
 #include "driver/i2c.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
 
 #include "distance_sensor.h"
+#include "telemetry.h"
 
 #define DYP_I2C_PORT            I2C_NUM_0
 #define DYP_I2C_SDA             GPIO_NUM_4
@@ -33,11 +35,12 @@ static TimerHandle_t     s_meas_timer;   /* one-shot: fires DYP_MEASURE_MS after
 static TimerHandle_t     s_health_timer; /* periodic: I2C bus health scan */
 static volatile int32_t  s_last_mm = DISTANCE_SENSOR_ERR;
 
-/* Caller must hold s_bus_mutex. */
-static void i2c_scan(void)
+/* Caller must hold s_bus_mutex.
+ * Returns true if DYP_I2C_ADDR (0x74) acknowledged — used by health_scan_cb. */
+static bool i2c_scan(void)
 {
     ESP_LOGI(TAG, "I2C scan");
-    bool found = false;
+    bool sensor_present = false;
     for (uint8_t addr = 1; addr < 127; addr++) {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
@@ -47,10 +50,11 @@ static void i2c_scan(void)
         i2c_cmd_link_delete(cmd);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "  found 0x%02x", addr);
-            found = true;
+            if (addr == DYP_I2C_ADDR) sensor_present = true;
         }
     }
-    if (!found) ESP_LOGW(TAG, "  no devices found — check wiring");
+    if (!sensor_present) ESP_LOGW(TAG, "  DYP-A22 (0x74) not found — check wiring");
+    return sensor_present;
 }
 
 /* Send a measurement trigger and arm s_meas_timer.
@@ -119,7 +123,8 @@ static void meas_timer_cb(TimerHandle_t xTimer)
     dyp_trigger();  /* pipeline: start the next measurement immediately */
 }
 
-/* Periodic health check — skips gracefully if the bus is in use. */
+/* Periodic health check — skips gracefully if the bus is in use.
+ * Reports sensor presence via i2c_health event so the server can track connectivity. */
 static void health_scan_cb(TimerHandle_t xTimer)
 {
     (void)xTimer;
@@ -127,8 +132,11 @@ static void health_scan_cb(TimerHandle_t xTimer)
         ESP_LOGW(TAG, "health scan: bus busy, skipping");
         return;
     }
-    i2c_scan();
+    bool found = i2c_scan();
     xSemaphoreGive(s_bus_mutex);
+
+    uint32_t ts = (uint32_t)(esp_timer_get_time() / 1000);
+    telemetry_push_event("i2c_health", TELEM_BOOL(found), ts);
 }
 
 static esp_err_t dyp_a22_init(void)
