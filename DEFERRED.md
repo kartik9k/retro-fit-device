@@ -310,3 +310,33 @@ payload; update to `device_id` when the multi-tenant schema lands.
   The equivalent SQLite query uses `datetime('now', '-30 days')` but implementing
   this for SQLite is not worth the effort given the planned migration.
 - Update SERVER.md in the same commit.
+
+---
+
+## 15. Protobuf wire format (replace JSON)
+
+**Why deferred:** JSON is readable, already working, and costs nothing at the
+current scale (Wi-Fi, one batch POST every 30 s, payload under 1 KB).
+
+**Trigger condition:** Pick this up when **all three** of the following are true:
+1. Cellular transport is live (DEFERRED §1) — per-byte billing makes payload
+   size a measurable operating cost.
+2. Post frequency has increased to the point where JSON field-name overhead is
+   non-trivial relative to the payload body.
+3. The device fleet has grown enough that a schema enforcement gap (malformed
+   JSON reaching the server) has caused a real incident.
+
+**What changes:**
+- Define a `.proto` schema that replaces `API_CONTRACT.md` as the wire-format
+  source of truth. `API_CONTRACT.md` becomes a human-readable summary that
+  references the `.proto` file.
+- Firmware uses `nanopb` (no dynamic allocation, fixed-size fields) to encode.
+  `nanopb` is SDK/CPU-agnostic — it is the correct library choice here.
+- Server uses `protobuf` Python package to decode. `Content-Type` changes to
+  `application/x-protobuf`.
+- This is a **breaking change** — firmware and server must cut over atomically.
+  All devices in the field must be flashed before or simultaneously with the
+  server deploy. Plan a maintenance window.
+
+**What does NOT change:** the batched POST approach, the endpoint path, the
+device identifier, or the event key registry — only the encoding of the body.
