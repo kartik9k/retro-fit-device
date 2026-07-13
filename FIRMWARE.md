@@ -229,8 +229,7 @@ health_scan_cb() [timer-daemon, every DYP_HEALTH_SCAN_MS]
   └─ give s_bus_mutex
 
 dyp_a22_read_mm() [sensor_task]
-  ├─ xSemaphoreTake(s_result_sem, 0)    ← drain stale signal (non-blocking)
-  ├─ xSemaphoreTake(s_result_sem, 500 ms)  ← wait for next pipeline result
+  ├─ xSemaphoreTake(s_result_sem, 500 ms)
   │    └─ on timeout: restarts pipeline via dyp_trigger(), returns ERR
   └─ return s_last_mm
 ```

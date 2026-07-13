@@ -178,15 +178,9 @@ static esp_err_t dyp_a22_init(void)
 
 /* Non-blocking from the caller's perspective: blocks on s_result_sem rather than
  * vTaskDelay, so the pipeline's 80 ms measurement window never stalls sensor_task.
- * On timeout (pipeline stalled) the pipeline is restarted automatically.
- *
- * The pipeline runs continuously (~82 ms/cycle) so s_result_sem may already be
- * given when read_mm() is called. Draining it first ensures we always wait for
- * the next result produced after this call, not a leftover from a previous cycle. */
+ * On timeout (pipeline stalled) the pipeline is restarted automatically. */
 static int32_t dyp_a22_read_mm(void)
 {
-    xSemaphoreTake(s_result_sem, 0);   /* drain any stale pipeline signal */
-
     if (xSemaphoreTake(s_result_sem, DYP_RESULT_WAIT_TICKS) != pdTRUE) {
         ESP_LOGW(TAG, "result timeout — restarting pipeline");
         dyp_trigger();
