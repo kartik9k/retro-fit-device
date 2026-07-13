@@ -40,6 +40,7 @@ def _generate_batch(
     base_level: float,
     noise: float,
     batch_size: int,
+    sensor: str = "us",
     sensor_period_ms: int = 2000,
 ) -> list[dict]:
     """
@@ -59,7 +60,7 @@ def _generate_batch(
             drift = math.sin(boot_offset_ms / 300_000) * 10
             v = round(base_level + drift + random.gauss(0, noise), 1)
             v = max(2.0, v)  # clamp to sensor minimum range
-        readings.append({"v": v, "t": t})
+        readings.append({"k": sensor, "v": v, "t": t})
     return readings
 
 
@@ -77,7 +78,7 @@ def _post(url: str, payload: dict) -> dict:
 
 def run(args: argparse.Namespace) -> None:
     print(f"Target : {args.url}")
-    print(f"Device : {args.device}  sensor={args.sensor}")
+    print(f"Device : {args.device}  sensor={args.sensor}  proto=1.0")
     print(f"Level  : {args.base_level} cm ± {args.noise} cm noise")
 
     if args.continuous:
@@ -85,8 +86,8 @@ def run(args: argparse.Namespace) -> None:
         batch_num = 0
         while True:
             batch_num += 1
-            readings = _generate_batch(args.base_level, args.noise, args.batch_size)
-            payload = {"device": args.device, "sensor": args.sensor, "readings": readings}
+            readings = _generate_batch(args.base_level, args.noise, args.batch_size, args.sensor)
+            payload = {"proto": "1.0", "device": args.device, "readings": readings}
             try:
                 result = _post(args.url, payload)
                 print(f"[batch {batch_num:4d}]  inserted={result['inserted']}  "
@@ -102,8 +103,8 @@ def run(args: argparse.Namespace) -> None:
         while sent < total:
             batch_num += 1
             size = min(args.batch_size, total - sent)
-            readings = _generate_batch(args.base_level, args.noise, size)
-            payload = {"device": args.device, "sensor": args.sensor, "readings": readings}
+            readings = _generate_batch(args.base_level, args.noise, size, args.sensor)
+            payload = {"proto": "1.0", "device": args.device, "readings": readings}
             try:
                 result = _post(args.url, payload)
                 sent += result["inserted"]
