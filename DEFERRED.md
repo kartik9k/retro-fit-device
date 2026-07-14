@@ -35,37 +35,70 @@ boundary; the real driver slots in there without touching any other file.
 
 ## 2. Deep sleep architecture
 
-**Why deferred:** The current firmware runs two always-on FreeRTOS tasks
+**Status: design accepted 2026-07-14, not yet implemented.**
+
+**Original problem:** The current firmware runs two always-on FreeRTOS tasks
 (`sensor_task` at priority 8, `post_task` at priority 5). This is correct and
-efficient for Wi-Fi deployments where the device is mains-powered.
+efficient for Wi-Fi deployments where the device is mains-powered, but for
+cellular deployments targeting a 6-month battery life the device needs to draw
+far less current between POST cycles.
 
-For cellular deployments targeting a 6-month battery life the device must enter
-deep sleep between POST cycles. Deep sleep tears down all tasks and wakes via
-the RTC timer — it is architecturally incompatible with the current task loop
-without a redesign.
+**Decision: FreeRTOS tickless idle (light sleep), not true deep sleep.**
+True `esp_deep_sleep()` was the original plan, but it is a full chip reset on
+ESP8266 — RAM (and all FreeRTOS/task state) is lost on every cycle, wake is not
+a resume, and only the RTC timer can wake it (there is no GPIO wake source on
+this chip, unlike ESP32). That would have required collapsing `sensor_task` /
+`post_task` into a single-shot boot→read→post→sleep sequence, plus GPIO16 wired
+to RST on the board.
 
-**Battery analysis from triage (reference):**
+Tickless idle drives automatic **light sleep** instead: FreeRTOS state, RAM, and
+task structure are fully preserved, and the scheduler resumes normally on
+RTC/timer wake — no task collapse, no reboot-and-reinit cycle, no RTC-memory
+state juggling, no GPIO16↔RST wiring requirement. The tradeoff is higher sleep
+current (~0.4 mA light sleep vs ~20 µA true deep sleep).
 
-| POST interval | Avg current (ESP8266 + SIM7080G) | 6-month consumption |
-|---|---|---|
-| 30 s (current) | ~72 mA | 315 Ah — not feasible |
-| 10 min | ~3.8 mA | 16.6 Ah — feasible |
-| 15 min | ~2.5 mA | 11 Ah — comfortable |
+**Battery analysis (revised for light sleep + accepted 30-minute POST interval):**
 
-A 2S 18650 Li-ion pack (~14 Ah usable) covers 6 months at a 15-minute interval.
+Per-cycle burst cost (sensor read + SIM7080G TX) is ~2250 mA·s and dominates the
+average at these intervals — it does not change with sleep mode.
+
+| POST interval | Sleep mode | Avg current (ESP8266 + SIM7080G) | 6-month consumption | 14 Ah pack |
+|---|---|---|---|---|
+| 30 s (current, Wi-Fi) | n/a (always-on) | ~72 mA | 315 Ah — not feasible | — |
+| 10 min | light sleep | ~4.2 mA | ~18.3 Ah | not feasible |
+| 15 min | true deep sleep (reference, superseded) | ~2.5 mA | ~11 Ah | feasible, ~3 Ah slack |
+| **30 min** | **light sleep (accepted)** | **~1.65 mA** | **~7.2 Ah** | **feasible, ~6.8 Ah slack** |
+| 30 min | true deep sleep (reference) | ~1.27 mA | ~5.6 Ah | feasible, ~8.4 Ah slack |
+
+30-minute interval + light sleep gives more margin than the original 15-minute
+true-deep-sleep plan, while keeping the simpler event-driven architecture.
 
 **What must be true before implementing:**
-- PM must confirm minimum acceptable POST interval for cellular deployments —
-  this determines battery pack size and the sleep/wake cycle duration.
-- The DYP-A22 driver uses a self-sustaining FreeRTOS timer pipeline that fires
-  continuously at ~82 ms/cycle. Under deep sleep the pipeline must be replaced
-  with a single-shot trigger-wait-read sequence per wake — the task architecture
-  changes fundamentally.
-- Hardware Agent must confirm that the SIM7080G PSM wake latency (time from
-  deep sleep exit to first successful POST) fits within the desired window.
+- ~~PM must confirm minimum acceptable POST interval~~ — **confirmed 2026-07-14:
+  30 minutes.**
+- UI Agent must be notified: item 5 below (visualiser UX for sparse cadence)
+  was scoped against a 15-minute gap; 30 minutes makes the "looks broken"
+  problem worse and should be treated as a hard requirement of this change,
+  not a follow-on nice-to-have.
+- Firmware: enable `CONFIG_FREERTOS_USE_TICKLESS_IDLE` (or equivalent in the
+  ESP8266 RTOS SDK) and verify the existing `esp_timer` periodic POST timer and
+  the DYP-A22 FreeRTOS timer pipeline (`s_meas_timer`, `s_health_timer`) still
+  fire correctly across light-sleep transitions — light sleep must not silently
+  drop or delay these timers.
+- Firmware: verify Wi-Fi behavior under light sleep (modem sleep interaction)
+  doesn't break the existing Wi-Fi transport before cellular is live — this
+  path will be exercised as the actual test vehicle since the SIM7080G driver
+  (item 1) doesn't exist yet.
+- Hardware Agent must confirm SIM7080G PSM wake latency still fits within the
+  30-minute cycle (no GPIO16/RST wiring needed for light sleep, so this is the
+  only remaining hardware dependency).
+- `POST_PERIOD_US` / `SENSOR_PERIOD_MS` in `app_main.c` and the corresponding
+  table in `FIRMWARE.md` § Key configuration constants must be updated in the
+  same commit as the tickless-idle change.
 
-**Scope:** This is a significant firmware rework, not a small addition. Treat it
-as a standalone requirement with its own triage cycle.
+**Scope:** Smaller than the true-deep-sleep rework — no task collapse — but still
+a real change to timer/sleep behavior that needs bench validation before it's
+called done.
 
 ---
 
@@ -107,17 +140,33 @@ testing of the Wi-Fi path.
 
 ## 5. Visualiser UX for sparse cellular update cadence
 
-**Why deferred:** The live visualiser (`server/static/index.html`) renders a
-continuous line chart. At a 15-minute POST interval the chart will show long
-flat gaps between points, which looks broken to a user who does not know the
-device is on cellular.
+**Status: escalated 2026-07-14 — no longer optional polish, see below.**
+
+**Why deferred (original):** The live visualiser (`server/static/index.html`)
+renders a continuous line chart. At a 15-minute POST interval the chart will
+show long flat gaps between points, which looks broken to a user who does not
+know the device is on cellular.
+
+**Update from deep sleep triage (item 2):** The accepted cellular sleep/wake
+design uses a 30-minute POST interval (light sleep, not the original 15-minute
+assumption this item was scoped against). Twice the gap length makes the
+"looks broken" problem worse, not better. **UI Agent: treat this as a hard
+requirement of the deep sleep rollout, not a follow-on nice-to-have** — the
+dashboard should not go live against a 30-minute-cadence device without it.
 
 **Proposed UX (for when unblocked):** Add a "last updated X minutes ago"
 indicator that refreshes on a 30-second client-side timer. No server changes
-needed — the SSE stream already carries `recorded_at` timestamps.
+needed — the SSE stream already carries `recorded_at` timestamps. Given the
+longer gap, UI Agent should also consider whether the chart itself needs a
+visual treatment for gaps (e.g. dashed segment or gap marker) rather than a
+plain line straight across 30 minutes of nothing — worth a design pass, not
+just the timestamp indicator.
 
-**Blocked on:** Cellular driver being live in production so the actual UX
-problem can be observed and validated before building the fix.
+**Blocked on:** Cellular driver (item 1) and deep sleep architecture (item 2)
+being live so the actual UX problem can be observed and validated against real
+30-minute-cadence data before building the fix. Not blocked on hardware
+procurement — UI Agent can prototype against synthetic 30-minute-spaced data
+in the meantime if desired.
 
 ---
 
